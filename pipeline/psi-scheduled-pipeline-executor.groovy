@@ -6,8 +6,8 @@ def recipeFile = "RHCEPH-*.yaml"
 def recipeFileDir = "/ceph/cephci-jenkins/latest-rhceph-container-info"
 
 // Default job parameters
-def buildType = "${params.buildType}" ? "tier-1" : "${params.buildType}"
-def overrides = "${params.overrides}" ? "{}" : "${params.overrides}"
+def buildType = params.buildType?.trim() ?: "tier-1"
+def overrides = params.overrides?.trim() ?: "{}"
 def tags = "${params.tags}" ? "schedule,tier-1,stage-1,openstack" : "${params.tags}"
 
 

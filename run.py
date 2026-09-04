@@ -517,6 +517,12 @@ def get_html_page(url: str) -> str:
     return ""
 
 
+def _config_flag_enabled(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes")
+
+
 def run(args):
     import urllib3
 
@@ -1034,10 +1040,14 @@ def run(args):
                 config["ibm_build"] = ibm_build
 
                 if "enable-fips-mode" in custom_config_dict:
-                    config["enable_fips_mode"] = custom_config_dict["enable-fips-mode"]
+                    config["enable_fips_mode"] = _config_flag_enabled(
+                        custom_config_dict["enable-fips-mode"]
+                    )
 
                 if "enable-firewall" in custom_config_dict:
-                    config["enable_firewall"] = custom_config_dict["enable-firewall"]
+                    config["enable_firewall"] = _config_flag_enabled(
+                        custom_config_dict["enable-firewall"]
+                    )
 
                 if "podman-auth-file" in custom_config_dict:
                     config["podman_auth_file"] = custom_config_dict["podman-auth-file"]

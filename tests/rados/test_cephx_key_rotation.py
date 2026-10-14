@@ -20,6 +20,21 @@ Workflow:
     7. Lock the old cipher (auth_allowed_ciphers, auth_service_cipher if required).
     8. Final checks: no insecure key warnings, all ciphers are aes256k, OSDs are up.
 
+Gap-coverage mode (default when cluster is already on aes256k):
+    When the cluster ships with all ciphers already set to aes256k the test seeds
+    it with aes keys so that every rotation step is exercised.  The seeding is
+    fully reverted at the end of the run (or on error).
+
+    Seeding steps:
+        S1. Relax auth_allowed_ciphers to include aes.
+        S2. Force auth_preferred_cipher back to aes.
+        S3. Re-create a small set of test entities with aes keys.
+        S4. Run the full 8-step rotation workflow.
+        S5. Clean up the seeded entities and restore original cipher settings.
+
+    Set config: seed_aes_keys: false to disable seeding (e.g. on an upgrade run
+    where the cluster naturally has aes keys).
+
 Optional services (NFS / SMB / rbd-mirror / RGW multisite) are not driven by this test;
 their client.* entities are still rotated by step 5 when they are reported as insecure.
 
@@ -27,6 +42,8 @@ Config (all optional):
     config:
         cipher: aes256k            # target cipher (default aes256k)
         wait_timeout: 600          # seconds to wait for health / daemons to settle
+        seed_aes_keys: true        # seed aes keys when cluster is already migrated
+                                   # set false on real upgrade runs
 """
 
 import re
@@ -46,6 +63,9 @@ CLIENT_WARN = "AUTH_INSECURE_CLIENT_KEY_TYPE"
 SERVICE_WARN = "AUTH_INSECURE_SERVICE_KEY_TYPE"
 RECONFIG_TYPES = ("osd", "mds", "mgr", "rgw")
 
+# Entities created by the seed step; removed during teardown.
+_SEED_ENTITIES = ["client.cephx-seed-1", "client.cephx-seed-2"]
+
 
 class CephxRotation:
     """Helper that runs ceph commands through cephadm shell on the installer node."""
@@ -57,6 +77,8 @@ class CephxRotation:
         self.wait_timeout = wait_timeout
         # (entity name, host keyring path) once client.admin has been rotated
         self.identity = None
+        # cipher settings captured before seeding so teardown can restore them
+        self._pre_seed_settings = {}
 
     # ------------------------------------------------------------------ helpers
     def ceph(self, args, as_json=False, check=True, timeout=300):
@@ -149,13 +171,8 @@ class CephxRotation:
         osds = self.ceph("osd dump", as_json=True).get("osds", [])
         return [o["osd"] for o in osds if not o.get("up")]
 
-    # -------------------------------------------------------------------- steps
     def is_already_migrated(self):
-        """True when ciphers are already locked to the target and no insecure keys remain.
-
-        Fresh IBM/Tentacle deploys often ship already on aes256k-only. The aes->aes256k
-        runbook steps do not apply in that state.
-        """
+        """True when ciphers are already locked to the target and no insecure keys remain."""
         settings = self.cipher_settings()
         target = [self.cipher]
         checks = self.health_checks()
@@ -172,6 +189,86 @@ class CephxRotation:
             and not insecure
         )
 
+    # --------------------------------------------------------- aes seed / teardown
+    def seed_aes_keys(self):
+        """Relax the cluster back to aes so the rotation steps have real work to do.
+
+        Called only when the cluster is already fully on aes256k.  Steps:
+          S1. Allow aes alongside aes256k.
+          S2. Set preferred cipher back to aes so new entities get aes keys.
+          S3. Create two test client entities with --key-type aes.
+          S4. Restore auth_preferred_cipher to aes256k (so the test starts from
+              the 'preferred is already set' state the runbook describes).
+
+        After seeding:
+          - auth_allowed_ciphers: aes, aes256k
+          - auth_preferred_cipher: aes256k
+          - Two client.cephx-seed-* entities have aes keys → AUTH_INSECURE_CLIENT_KEY_TYPE
+        """
+        log.info(
+            "=== SEED: relaxing cluster to aes keys for full rotation coverage ==="
+        )
+        # Snapshot current settings so teardown can restore them precisely.
+        self._pre_seed_settings = self.cipher_settings()
+        log.info(f"Pre-seed cipher settings: {self._pre_seed_settings}")
+
+        # S1: allow both ciphers
+        self.ceph("mon set auth_allowed_ciphers aes,aes256k")
+        log.info("SEED S1: auth_allowed_ciphers set to aes,aes256k")
+
+        # S2: set preferred to aes so the get-or-create below mints aes keys
+        self.ceph("mon set auth_preferred_cipher aes")
+        log.info("SEED S2: auth_preferred_cipher set to aes")
+
+        # S3: create seed entities (aes keys because preferred is now aes)
+        for entity in _SEED_ENTITIES:
+            # Remove any leftover from a previous failed run first.
+            self.ceph(f"auth rm {entity}", check=False)
+            self.ceph(f"auth get-or-create {entity} mon 'allow r'")
+            log.info(f"SEED S3: created {entity} with aes key")
+
+        # S4: restore preferred to aes256k — the seeded entities remain aes
+        self.ceph(f"mon set auth_preferred_cipher {self.cipher}")
+        log.info("SEED S4: auth_preferred_cipher restored to aes256k")
+        log.info(
+            "=== SEED complete: AUTH_INSECURE_CLIENT_KEY_TYPE should now be present ==="
+        )
+        log.info(f"Health checks after seed: {list(self.health_checks())}")
+
+    def teardown_aes_seed(self):
+        """Remove seeded entities and restore original cipher settings.
+
+        Always safe to call; commands that fail (entity already removed, etc.) are
+        logged but do not raise so cleanup completes even on error paths.
+        """
+        log.info(
+            "=== TEARDOWN: removing seeded entities and restoring cipher settings ==="
+        )
+        for entity in _SEED_ENTITIES:
+            self.ceph(f"auth rm {entity}", check=False)
+            log.info(f"TEARDOWN: removed {entity} (if present)")
+
+        # Restore original cipher values.  The run may have left aes256k-only
+        # (which is correct), but if pre-seed was aes256k-only too just confirm.
+        restored = self._pre_seed_settings
+        if not restored:
+            log.info("TEARDOWN: no pre-seed settings recorded, skipping restore")
+            return
+
+        # Restore allowed_ciphers last so we don't lock out aes before removing
+        # entities; restore preferred first.
+        for key, cmd in (
+            ("auth_preferred_cipher", "mon set auth_preferred_cipher"),
+            ("auth_service_cipher", "mon set auth_service_cipher"),
+            ("auth_allowed_ciphers", "mon set auth_allowed_ciphers"),
+        ):
+            value = restored.get(key)
+            if value:
+                self.ceph(f"{cmd} {','.join(value)}", check=False)
+                log.info(f"TEARDOWN: restored {key} to {value}")
+        log.info("=== TEARDOWN complete ===")
+
+    # -------------------------------------------------------------------- steps
     def step1_confirm_upgrade_complete(self):
         log.info("Step 1: confirm upgrade is complete and aes256k is allowed")
         log.info(self.ceph("version"))
@@ -181,7 +278,10 @@ class CephxRotation:
         log.info(f"Upgrade status: {status}")
         if status.startswith("{") and loads(status).get("in_progress"):
             raise AssertionError("Upgrade is still in progress")
-        if not status.startswith("{") and "no upgrades in progress" not in status:
+        if (
+            not status.startswith("{")
+            and "no upgrades in progress" not in status.lower()
+        ):
             raise AssertionError(f"Unexpected upgrade status output: {status}")
         if self.cipher not in self.cipher_settings().get("auth_allowed_ciphers", []):
             raise AssertionError(
@@ -194,28 +294,15 @@ class CephxRotation:
         preferred = self.cipher_settings().get("auth_preferred_cipher")
         if preferred != [self.cipher]:
             raise AssertionError(f"auth_preferred_cipher is {preferred}")
-        # aes must stay allowed until every client is rotated — but only when a
-        # migration is still in progress. Clusters already locked to aes256k-only
-        # (common on fresh 9.x deploys) are not "too early"; they are done.
+        # aes must stay in allowed ciphers while insecure keys still exist.
         allowed = self.cipher_settings().get("auth_allowed_ciphers", [])
-        if "aes" in allowed:
-            return
-        checks = self.health_checks()
-        if CLIENT_WARN in checks or SERVICE_WARN in checks:
-            raise AssertionError(
-                "aes removed from auth_allowed_ciphers too early "
-                "(insecure key warnings still present)"
-            )
-        if self.is_already_migrated():
-            log.info(
-                "aes absent from auth_allowed_ciphers and cluster is already fully "
-                "on %s with no insecure keys — migration precondition already met",
-                self.cipher,
-            )
-            return
-        raise AssertionError(
-            f"aes absent from auth_allowed_ciphers and cluster is not fully on {self.cipher}"
-        )
+        if "aes" not in allowed:
+            checks = self.health_checks()
+            if CLIENT_WARN in checks or SERVICE_WARN in checks:
+                raise AssertionError(
+                    "aes removed from auth_allowed_ciphers too early "
+                    "(insecure key warnings still present)"
+                )
 
     def step4_rotate_admin(self):
         log.info("Step 4: rotate client.admin with a backup credential")
@@ -304,7 +391,9 @@ class CephxRotation:
         log.info("Step 6: rotate service keys that did not auto rotate")
         entities = self.insecure_entities(SERVICE_WARN)
         if not entities:
-            log.info("No insecure service keys reported")
+            log.info(
+                "No insecure service keys reported — auto-rotation succeeded or not needed"
+            )
             return
         # Rotate one OSD first, confirm it stays up and leaves the insecure list
         entities.sort(key=lambda e: (not e.startswith("osd."), e))
@@ -332,7 +421,9 @@ class CephxRotation:
         settings = self.cipher_settings()
         # IBM text only sets auth_allowed_ciphers; auth_service_cipher was also required on 413
         if settings.get("auth_service_cipher") != [self.cipher]:
-            log.info("auth_service_cipher not updated, setting it explicitly")
+            log.info(
+                "auth_service_cipher not updated, setting it explicitly (413 finding)"
+            )
             self.ceph(f"mon set auth_service_cipher {self.cipher}")
 
     def recover_osds(self):
@@ -364,7 +455,7 @@ class CephxRotation:
             raise AssertionError(f"Insecure key warnings remain: {insecure}")
         if "AUTH_INSECURE_ROTATING_SERVICE_KEY_TYPE" in checks:
             log.warning(
-                "AUTH_INSECURE_ROTATING_SERVICE_KEY_TYPE still reported (known finding)"
+                "AUTH_INSECURE_ROTATING_SERVICE_KEY_TYPE still reported (known 413 finding)"
             )
         settings = self.cipher_settings()
         for name in (
@@ -383,11 +474,18 @@ class CephxRotation:
 def run(ceph_cluster, **kw):
     """Validate the CephX aes -> aes256k key rotation workflow.
 
+    When the cluster is already fully on aes256k (fresh IBM/Tentacle deploy) the
+    test seeds it with aes keys so every rotation step is exercised. Set
+    config: seed_aes_keys: false to disable seeding (real upgrade runs where the
+    cluster naturally has aes keys from a previous release).
+
     Returns:
         0 -> Pass, 1 -> Fail
     """
     log.info(run.__doc__)
     config = kw.get("config", {})
+    do_seed = config.get("seed_aes_keys", True)
+    seeded = False
     rotation = CephxRotation(
         ceph_cluster,
         cipher=config.get("cipher", "aes256k"),
@@ -395,25 +493,41 @@ def run(ceph_cluster, **kw):
     )
     try:
         rotation.step1_confirm_upgrade_complete()
-        if rotation.is_already_migrated():
+
+        already_migrated = rotation.is_already_migrated()
+        if already_migrated:
+            if not do_seed:
+                log.info(
+                    "Cluster already fully on %s and seed_aes_keys is false; "
+                    "running final checks only",
+                    rotation.cipher,
+                )
+                rotation.step8_final_checks()
+                log.info("CephX key rotation completed successfully (already migrated)")
+                return 0
             log.info(
-                "Cluster already fully on %s with no insecure key warnings; "
-                "skipping aes->%s rotation steps and verifying final state",
-                rotation.cipher,
+                "Cluster already on %s — seeding aes keys to exercise all rotation steps",
                 rotation.cipher,
             )
-            rotation.step8_final_checks()
-            log.info("CephX key rotation completed successfully (already migrated)")
-            return 0
+            rotation.seed_aes_keys()
+            seeded = True
+
+        # Full 8-step rotation workflow
         rotation.step2_set_preferred_cipher()
-        log.info("Step 3: leftover keys before rotation")
-        rotation.insecure_entities(CLIENT_WARN)
-        rotation.insecure_entities(SERVICE_WARN)
+        log.info("Step 3: identify leftover insecure keys before rotation")
+        client_insecure = rotation.insecure_entities(CLIENT_WARN)
+        service_insecure = rotation.insecure_entities(SERVICE_WARN)
+        log.info(
+            "Insecure clients: %s  |  Insecure services: %s",
+            client_insecure,
+            service_insecure,
+        )
         rotation.step4_rotate_admin()
         rotation.step5_rotate_clients()
         rotation.step6_rotate_services()
         rotation.step7_lock_cipher()
         rotation.step8_final_checks()
+
     except Exception as err:
         log.error(f"CephX key rotation failed: {err}")
         log.exception(err)
@@ -422,5 +536,9 @@ def run(ceph_cluster, **kw):
             "for recovery - re-export client.admin with it, validate, then copy to /etc/ceph."
         )
         return 1
+    finally:
+        if seeded:
+            rotation.teardown_aes_seed()
+
     log.info("CephX key rotation completed successfully")
     return 0

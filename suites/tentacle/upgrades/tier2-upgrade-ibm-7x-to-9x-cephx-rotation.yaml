@@ -1,0 +1,139 @@
+#################################################################################
+# CephX key rotation validation on a real upgrade path: IBM 7.1 → IBMSC 9.x
+#
+# This suite exercises the full aes → aes256k rotation workflow on a cluster
+# that was deployed with an older release (IBM 7.1, which uses aes keys) and
+# upgraded to the latest tentacle build.  After upgrade the cluster naturally
+# has insecure key warnings — no synthetic seeding is required.
+#
+#--------------------------------------------------------------------------------
+# Cluster Configuration:
+#   conf/tentacle/upgrades/1admin-3node-1client-upgrade.yaml
+#
+# Test Steps:
+#   1. Deploy IBM 7.1 cluster (CephFS + RGW + MDS deployed)
+#   2. Configure client node
+#   3. Upgrade cluster to latest IBM 9.x (tentacle) build
+#   4. Validate cluster health post upgrade
+#   5. Run CephX key rotation (seed_aes_keys: false — real aes keys from upgrade)
+#################################################################################
+tests:
+  - test:
+      name: setup install pre-requisistes
+      desc: Setup phase to deploy the required pre-requisites for running the tests.
+      module: install_prereq.py
+      abort-on-fail: true
+
+  - test:
+      name: Deploy IBM 7.1 cluster
+      desc: Bootstrap and deploy services on IBM 7.1 with label placements
+      module: test_cephadm.py
+      polarion-id: CEPH-83573777
+      destroy-cluster: false
+      abort-on-fail: true
+      config:
+        verify_cluster_health: true
+        steps:
+          - config:
+              command: bootstrap
+              service: cephadm
+              args:
+                rhcs-version: 7.1
+                release: "rc"
+                mon-ip: node1
+                orphan-initial-daemons: true
+          - config:
+              command: add_hosts
+              service: host
+              args:
+                attach_ip_address: true
+                labels: apply-all-labels
+          - config:
+              command: apply
+              service: mgr
+              args:
+                placement:
+                  label: mgr
+          - config:
+              command: apply
+              service: mon
+              args:
+                placement:
+                  label: mon
+          - config:
+              command: apply
+              service: osd
+              args:
+                all-available-devices: true
+          - config:
+              command: shell
+              args:
+                - ceph
+                - fs
+                - volume
+                - create
+                - cephfs
+          - config:
+              command: apply
+              service: mds
+              base_cmd_args:
+                verbose: true
+              pos_args:
+                - cephfs
+              args:
+                placement:
+                  nodes:
+                    - node2
+                    - node3
+                  limit: 2
+                  sep: " "
+          - config:
+              command: apply
+              service: rgw
+              pos_args:
+                - rgw.1
+              args:
+                placement:
+                  label: rgw
+
+  - test:
+      name: configure client
+      desc: Configure the RGW/RBD client node
+      module: test_client.py
+      destroy-cluster: false
+      abort-on-fail: true
+      config:
+        command: add
+        id: client.1
+        node: node4
+        install_packages:
+          - ceph-common
+        copy_admin_keyring: true
+
+  - test:
+      name: Upgrade cluster to latest IBM 9.x ceph version
+      desc: Upgrade cluster from IBM 7.1 to latest IBMSC 9.x (tentacle)
+      module: test_cephadm_upgrade.py
+      polarion-id: CEPH-83573791,CEPH-83573790
+      config:
+        command: start
+        service: upgrade
+        base_cmd_args:
+          verbose: true
+        verify_cluster_health: true
+      destroy-cluster: false
+      abort-on-fail: true
+
+  - test:
+      name: CephX key rotation aes to aes256k post upgrade
+      desc: >
+        Rotate all aes entity keys (client.admin, bootstrap keys, RGW client keys,
+        and any service keys that did not auto-rotate during upgrade) to aes256k.
+        Lock the old cipher. Verify no insecure key warnings remain.
+        seed_aes_keys is false because the upgrade from 7.1 naturally produces
+        AUTH_INSECURE_CLIENT_KEY_TYPE and AUTH_INSECURE_SERVICE_KEY_TYPE.
+      module: test_cephx_key_rotation.py
+      config:
+        cipher: aes256k
+        wait_timeout: 600
+        seed_aes_keys: false

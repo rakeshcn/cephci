@@ -748,11 +748,14 @@ def workaround_openssl_issue(node, base_url=None) -> None:
     Ensure openssl >= 3.5.1 is installed so ceph-common can resolve
     libcrypto.so.3(OPENSSL_3.4.0) on RHEL 9 nodes.
 
-    Strategy (in order):
+    Strategy (tried in order until openssl reaches the minimum version):
       1. If base_url points to an IBM Ceph build, add the corresponding
-         .repo file and let yum upgrade openssl from that repo.
-         This keeps openssl in sync with the exact build under test.
-      2. No-op when the installed version already satisfies the minimum.
+         .repo file temporarily and let yum upgrade openssl from that repo.
+      2. Fallback: run 'yum install -y --nogpgcheck openssl openssl-libs openssl-devel'
+         against whatever repos are already enabled on the node (e.g. the ceph-Tools
+         repo that ibm-storage-ceph-license setup already configured). This covers
+         nodes where base_url is not available (rhcs_version: default runs) but the
+         IBM build repo is already present from a prior step.
 
     NOTE:
         Remove once supported RHEL 9 BaseOS streams provide OPENSSL_3.4.0.
@@ -761,7 +764,7 @@ def workaround_openssl_issue(node, base_url=None) -> None:
     Args:
         node:     cluster node object
         base_url: compose base URL (config["base_url"]) — used to derive
-                  the IBM Ceph .repo file URL.
+                  the IBM Ceph .repo file URL (optional).
     """
     log_host_environment(node, stage="openssl-check")
     current = _installed_openssl_version(node)
@@ -775,37 +778,38 @@ def workaround_openssl_issue(node, base_url=None) -> None:
         return
 
     log.info(
-        "openssl %s on %s is below %s; attempting upgrade via IBM Ceph repo",
+        "openssl %s on %s is below %s; attempting upgrade",
         current if current is not None else "missing",
         node.hostname,
         OPENSSL_MIN_VERSION,
     )
 
     repo_url = _build_repo_url(base_url)
-    if not repo_url:
-        log.warning(
-            "No IBM Ceph base_url available on %s; cannot add repo for openssl upgrade. "
-            "Pass --rhs-ceph-repo or ensure config[base_url] is set.",
+    if repo_url:
+        log.info("Adding IBM Ceph repo from %s on %s", repo_url, node.hostname)
+        node.exec_command(
+            sudo=True,
+            cmd=f"curl -sSLo {_OPENSSL_REPO_DEST} {repo_url}",
+            long_running=True,
+        )
+    else:
+        log.info(
+            "No IBM Ceph base_url on %s; trying upgrade via already-enabled repos",
             node.hostname,
         )
-        return
 
-    log.info("Adding IBM Ceph repo from %s on %s", repo_url, node.hostname)
-    node.exec_command(
-        sudo=True,
-        cmd=f"curl -sSLo {_OPENSSL_REPO_DEST} {repo_url}",
-        long_running=True,
-    )
     node.exec_command(
         sudo=True,
         cmd="yum install -y --nogpgcheck openssl openssl-libs openssl-devel",
         long_running=True,
     )
-    # Remove the temporary repo file so it does not interfere with later yum operations.
-    node.exec_command(sudo=True, cmd=f"rm -f {_OPENSSL_REPO_DEST}")
+
+    if repo_url:
+        # Remove the temporary repo file so it does not interfere with later yum operations.
+        node.exec_command(sudo=True, cmd=f"rm -f {_OPENSSL_REPO_DEST}")
 
     upgraded = _installed_openssl_version(node)
-    log.info("openssl after repo upgrade on %s: %s", node.hostname, upgraded)
+    log.info("openssl after upgrade on %s: %s", node.hostname, upgraded)
     if upgraded is None or upgraded < OPENSSL_MIN_VERSION:
         log.error(
             "openssl upgrade failed on %s: still at %s (need >= %s)",

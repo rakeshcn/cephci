@@ -12,6 +12,7 @@ from typing import Dict, Optional
 
 from cephci.utils.build_info import CephTestManifest
 from cli.utilities.configure import setup_ibm_licence
+from tests.misc_env.install_prereq import workaround_openssl_issue
 from utility.log import Log
 
 from .bootstrap import BootstrapMixin
@@ -257,6 +258,13 @@ class CephAdmin(BootstrapMixin, ShellMixin, RegistryLoginMixin):
                     setup_ibm_licence(node, build_type=None)
 
                 node.exec_command(sudo=True, cmd="yum update metadata", check_ec=False)
+
+                # ceph-common upgrade requires libcrypto.so.3(OPENSSL_3.4.0) on RHEL 9.
+                # Upgrade openssl first so the yum update ceph* does not fail.
+                rhel_ver = node.distro_info.get("VERSION_ID", "").split(".")[0]
+                if rhel_ver == "9":
+                    workaround_openssl_issue(node, base_url=self.config.get("base_url"))
+
                 upd_cmd = "yum update --nogpgcheck -y 'ceph*'"
                 if kwargs.get("rpm_version", None):
                     upd_cmd = f"{upd_cmd}-{kwargs['rpm_version']}"

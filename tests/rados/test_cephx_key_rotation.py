@@ -150,6 +150,28 @@ class CephxRotation:
         return [o["osd"] for o in osds if not o.get("up")]
 
     # -------------------------------------------------------------------- steps
+    def is_already_migrated(self):
+        """True when ciphers are already locked to the target and no insecure keys remain.
+
+        Fresh IBM/Tentacle deploys often ship already on aes256k-only. The aes->aes256k
+        runbook steps do not apply in that state.
+        """
+        settings = self.cipher_settings()
+        target = [self.cipher]
+        checks = self.health_checks()
+        insecure = [
+            name
+            for name in checks
+            if name.startswith("AUTH_INSECURE")
+            and name != "AUTH_INSECURE_ROTATING_SERVICE_KEY_TYPE"
+        ]
+        return (
+            settings.get("auth_allowed_ciphers") == target
+            and settings.get("auth_preferred_cipher") == target
+            and settings.get("auth_service_cipher") == target
+            and not insecure
+        )
+
     def step1_confirm_upgrade_complete(self):
         log.info("Step 1: confirm upgrade is complete and aes256k is allowed")
         log.info(self.ceph("version"))
@@ -172,9 +194,28 @@ class CephxRotation:
         preferred = self.cipher_settings().get("auth_preferred_cipher")
         if preferred != [self.cipher]:
             raise AssertionError(f"auth_preferred_cipher is {preferred}")
-        # aes must stay allowed until every client is rotated
-        if "aes" not in self.cipher_settings().get("auth_allowed_ciphers", []):
-            raise AssertionError("aes removed from auth_allowed_ciphers too early")
+        # aes must stay allowed until every client is rotated — but only when a
+        # migration is still in progress. Clusters already locked to aes256k-only
+        # (common on fresh 9.x deploys) are not "too early"; they are done.
+        allowed = self.cipher_settings().get("auth_allowed_ciphers", [])
+        if "aes" in allowed:
+            return
+        checks = self.health_checks()
+        if CLIENT_WARN in checks or SERVICE_WARN in checks:
+            raise AssertionError(
+                "aes removed from auth_allowed_ciphers too early "
+                "(insecure key warnings still present)"
+            )
+        if self.is_already_migrated():
+            log.info(
+                "aes absent from auth_allowed_ciphers and cluster is already fully "
+                "on %s with no insecure keys — migration precondition already met",
+                self.cipher,
+            )
+            return
+        raise AssertionError(
+            f"aes absent from auth_allowed_ciphers and cluster is not fully on {self.cipher}"
+        )
 
     def step4_rotate_admin(self):
         log.info("Step 4: rotate client.admin with a backup credential")
@@ -354,6 +395,16 @@ def run(ceph_cluster, **kw):
     )
     try:
         rotation.step1_confirm_upgrade_complete()
+        if rotation.is_already_migrated():
+            log.info(
+                "Cluster already fully on %s with no insecure key warnings; "
+                "skipping aes->%s rotation steps and verifying final state",
+                rotation.cipher,
+                rotation.cipher,
+            )
+            rotation.step8_final_checks()
+            log.info("CephX key rotation completed successfully (already migrated)")
+            return 0
         rotation.step2_set_preferred_cipher()
         log.info("Step 3: leftover keys before rotation")
         rotation.insecure_entities(CLIENT_WARN)

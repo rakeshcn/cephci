@@ -8,6 +8,7 @@ from ceph.parallel import parallel
 from ceph.utils import get_node_by_id
 from cephci.utils.build_info import CephTestManifest
 from cli.utilities.configure import setup_ibm_licence
+from tests.misc_env.install_prereq import workaround_openssl_issue
 from utility import utils
 from utility.log import Log
 
@@ -195,6 +196,11 @@ def add(cls, config: Dict) -> None:
                 _manifest = manifest_obj or cls.config.get("manifest")
                 if _manifest and _manifest.product == "ibm":
                     setup_ibm_licence(_node, build_type=_manifest.build_type)
+
+                # ceph-common on RHEL 9 requires libcrypto.so.3(OPENSSL_3.4.0).
+                # Ensure openssl >= 3.5.1 before installing packages.
+                if rhel_version == "9":
+                    workaround_openssl_issue(_node, base_url=cls.config.get("base_url"))
 
                 for pkg in config.get("install_packages"):
                     if _rpm_version:

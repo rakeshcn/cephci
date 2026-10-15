@@ -690,11 +690,19 @@ def update_iptables(node):
 # Minimum openssl that provides libcrypto.so.3(OPENSSL_3.4.0) for ceph-common.
 OPENSSL_MIN_VERSION = Version("3.5.1")
 
-# Repo file name suffix for IBM Ceph RHEL 9 builds.
-# The full repo URL is <base_url>/<build_id>-rhel9.repo where build_id is the
-# last path segment of base_url, e.g.:
-#   https://public.dhe.ibm.com/ibmdl/.../IBM-CEPH-9.9.2-202609300703.ci.0
-# → repo file: IBM-CEPH-9.9.2-202609300703.ci.0-rhel9.repo
+# UBI CDN RPMs used when the IBM/lab compose does not ship openssl >= 3.5.1.
+# (IBM-CEPH / repo.qe.ceph.lab build trees ship ceph-* only.)
+OPENSSL_CDN_NVR = "3.5.8-2.el9_8"
+OPENSSL_CDN_BASEOS = (
+    "https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/"
+    "x86_64/baseos/os/Packages/o"
+)
+OPENSSL_CDN_APPSTREAM = (
+    "https://cdn-ubi.redhat.com/content/public/ubi/dist/ubi9/9/"
+    "x86_64/appstream/os/Packages/o"
+)
+
+# Temporary yum repo used while attempting an openssl upgrade.
 _OPENSSL_REPO_DEST = "/etc/yum.repos.d/ceph-openssl-workaround.repo"
 
 
@@ -718,29 +726,134 @@ def _installed_openssl_version(node):
         return None
 
 
+def _is_lab_manifest_compose(base_url):
+    """True for QE lab / manifest eu-de compose roots (not a .repo file).
+
+    Examples:
+      http://repo.qe.ceph.lab/repos/ceph/testing/ibm/9/rhel9/20.2.2-349/
+      http://mirror/.../repos/ceph/testing/ibm/9/rhel9/20.2.2-349/
+    """
+    if not base_url:
+        return False
+    lowered = base_url.lower().rstrip("/")
+    if lowered.endswith(".repo"):
+        return False
+    return "repo.qe.ceph.lab" in lowered or "/repos/ceph/" in lowered
+
+
 def _build_repo_url(base_url):
-    """Derive the .repo file URL from the compose base_url.
+    """Return a remote .repo URL for public.dhe / manifest default repos.
 
-    IBM Ceph compose URLs end with the build ID, e.g.:
-      https://public.dhe.ibm.com/ibmdl/export/pub/storage/ceph/testing/
-      IBM-CEPH-9.9.2-202609300703.ci.0
+    Accepted forms:
+      1. Full .repo URL (manifest ``repositories.default``), e.g.
+         https://public.dhe.ibm.com/.../IBM-CEPH-9.9.2-.../IBM-CEPH-9.9.2-...-rhel9.repo
+      2. public.dhe compose directory ending in IBM-CEPH-*, e.g.
+         https://public.dhe.ibm.com/.../IBM-CEPH-9.9.2-202609300703.ci.0
+         → <base>/<build_id>-rhel9.repo
 
-    The matching repo file is at:
-      <base_url>/IBM-CEPH-9.9.2-202609300703.ci.0-rhel9.repo
+    Lab/manifest eu-de compose roots are handled by
+    ``_write_lab_compose_repo`` instead (no remote .repo file).
 
-    Returns None when base_url is falsy or does not look like an IBM build URL.
+    Returns None when base_url is falsy or not a public.dhe-style URL.
     """
     if not base_url:
         return None
-    build_id = base_url.rstrip("/").rsplit("/", 1)[-1]
-    if not build_id.startswith("IBM-CEPH-"):
-        log.debug(
-            "base_url %r does not look like an IBM Ceph build URL; "
-            "openssl repo workaround skipped",
-            base_url,
-        )
+    trimmed = base_url.strip().rstrip("/")
+    if trimmed.endswith(".repo"):
+        return trimmed
+    build_id = trimmed.rsplit("/", 1)[-1]
+    if build_id.startswith("IBM-CEPH-"):
+        return f"{trimmed}/{build_id}-rhel9.repo"
+    if _is_lab_manifest_compose(trimmed):
         return None
-    return f"{base_url.rstrip('/')}/{build_id}-rhel9.repo"
+    log.debug(
+        "base_url %r is not a public.dhe .repo / IBM-CEPH compose URL; "
+        "remote openssl repo skipped",
+        base_url,
+    )
+    return None
+
+
+def _write_lab_compose_repo(node, base_url):
+    """Write a temporary yum repo pointing at a lab/manifest compose root.
+
+    Manifest eu-de URLs rewrite public.dhe
+    ``.../IBM-CEPH-.../rhel9/$basearch/`` trees to
+    ``http://repo.qe.ceph.lab/repos/ceph/testing/ibm/<maj>/rhel9/<nvr>/``.
+    Use ``$basearch`` when the path already ends at the rhelN level (same
+    layout as the public.dhe .repo baseurl).
+    """
+    root = base_url.rstrip("/")
+    # .../rhel9/<nvr> or .../rhel10/<nvr> → packages under $basearch/
+    if re.search(r"/rhel\d+/[^/]+$", root, re.I):
+        yum_baseurl = f"{root}/$basearch/"
+    else:
+        yum_baseurl = f"{root}/"
+    content = (
+        "[ceph-openssl-workaround]\n"
+        "name=ceph-openssl-workaround\n"
+        f"baseurl={yum_baseurl}\n"
+        "gpgcheck=0\n"
+        "enabled=1\n"
+    )
+    log.info(
+        "Writing lab/manifest compose repo on %s (baseurl=%s)",
+        node.hostname,
+        yum_baseurl,
+    )
+    # Single-quoted heredoc so $basearch is preserved for yum.
+    node.exec_command(
+        sudo=True,
+        cmd=f"cat > {_OPENSSL_REPO_DEST} <<'EOF'\n{content}EOF",
+        long_running=True,
+    )
+    return True
+
+
+def _add_openssl_workaround_repo(node, base_url):
+    """Add a temporary yum repo from public.dhe or lab/manifest base_url.
+
+    Returns True when a temporary repo file was installed (caller must remove it).
+    """
+    repo_url = _build_repo_url(base_url)
+    if repo_url:
+        log.info("Adding public.dhe/manifest .repo from %s on %s", repo_url, node.hostname)
+        node.exec_command(
+            sudo=True,
+            cmd=f"curl -sSLo {_OPENSSL_REPO_DEST} {repo_url}",
+            long_running=True,
+        )
+        return True
+    if _is_lab_manifest_compose(base_url):
+        return _write_lab_compose_repo(node, base_url)
+    log.info(
+        "No public.dhe or lab/manifest base_url on %s; "
+        "trying upgrade via already-enabled repos",
+        node.hostname,
+    )
+    return False
+
+
+def _upgrade_openssl_from_cdn(node) -> None:
+    """Force-install openssl >= 3.5.1 from the RHEL 9 UBI CDN."""
+    log.info(
+        "Installing openssl %s from UBI CDN on %s",
+        OPENSSL_CDN_NVR,
+        node.hostname,
+    )
+    rpms = [
+        f"{OPENSSL_CDN_BASEOS}/openssl-libs-{OPENSSL_CDN_NVR}.x86_64.rpm",
+        f"{OPENSSL_CDN_BASEOS}/openssl-{OPENSSL_CDN_NVR}.x86_64.rpm",
+        f"{OPENSSL_CDN_APPSTREAM}/openssl-devel-{OPENSSL_CDN_NVR}.x86_64.rpm",
+    ]
+    rpm_names = [url.rsplit("/", 1)[-1] for url in rpms]
+    for url in rpms:
+        node.exec_command(cmd=f"wget -q {url}", sudo=True, long_running=True)
+    node.exec_command(
+        cmd=f"rpm --force -Uvh {' '.join(rpm_names)}",
+        sudo=True,
+        long_running=True,
+    )
 
 
 def workaround_openssl_issue(node, base_url=None) -> None:
@@ -749,13 +862,15 @@ def workaround_openssl_issue(node, base_url=None) -> None:
     libcrypto.so.3(OPENSSL_3.4.0) on RHEL 9 nodes.
 
     Strategy (tried in order until openssl reaches the minimum version):
-      1. If base_url points to an IBM Ceph build, add the corresponding
-         .repo file temporarily and let yum upgrade openssl from that repo.
-      2. Fallback: run 'yum install -y --nogpgcheck openssl openssl-libs openssl-devel'
-         against whatever repos are already enabled on the node (e.g. the ceph-Tools
-         repo that ibm-storage-ceph-license setup already configured). This covers
-         nodes where base_url is not available (rhcs_version: default runs) but the
-         IBM build repo is already present from a prior step.
+      1. Add a temporary yum repo from config[base_url] when it is:
+         - a public.dhe / manifest ``*.repo`` URL, or
+         - a public.dhe ``IBM-CEPH-*`` compose directory, or
+         - a lab/manifest eu-de compose root (``repo.qe.ceph.lab`` /
+           ``/repos/ceph/...``).
+         Then ``yum install openssl openssl-libs openssl-devel``.
+      2. Fallback: same yum install against already-enabled repos.
+      3. Final fallback: force-install openssl from the RHEL 9 UBI CDN.
+         IBM/lab compose trees ship ceph packages only, not openssl 3.5.x.
 
     NOTE:
         Remove once supported RHEL 9 BaseOS streams provide OPENSSL_3.4.0.
@@ -763,8 +878,7 @@ def workaround_openssl_issue(node, base_url=None) -> None:
 
     Args:
         node:     cluster node object
-        base_url: compose base URL (config["base_url"]) — used to derive
-                  the IBM Ceph .repo file URL (optional).
+        base_url: compose / .repo URL (config["base_url"] / --rhs-ceph-repo).
     """
     log_host_environment(node, stage="openssl-check")
     current = _installed_openssl_version(node)
@@ -784,32 +898,33 @@ def workaround_openssl_issue(node, base_url=None) -> None:
         OPENSSL_MIN_VERSION,
     )
 
-    repo_url = _build_repo_url(base_url)
-    if repo_url:
-        log.info("Adding IBM Ceph repo from %s on %s", repo_url, node.hostname)
+    added_repo = _add_openssl_workaround_repo(node, base_url)
+    try:
         node.exec_command(
             sudo=True,
-            cmd=f"curl -sSLo {_OPENSSL_REPO_DEST} {repo_url}",
+            cmd="yum install -y --nogpgcheck openssl openssl-libs openssl-devel",
             long_running=True,
         )
-    else:
-        log.info(
-            "No IBM Ceph base_url on %s; trying upgrade via already-enabled repos",
-            node.hostname,
-        )
-
-    node.exec_command(
-        sudo=True,
-        cmd="yum install -y --nogpgcheck openssl openssl-libs openssl-devel",
-        long_running=True,
-    )
-
-    if repo_url:
-        # Remove the temporary repo file so it does not interfere with later yum operations.
-        node.exec_command(sudo=True, cmd=f"rm -f {_OPENSSL_REPO_DEST}")
+    finally:
+        if added_repo:
+            node.exec_command(sudo=True, cmd=f"rm -f {_OPENSSL_REPO_DEST}")
 
     upgraded = _installed_openssl_version(node)
-    log.info("openssl after upgrade on %s: %s", node.hostname, upgraded)
+    log.info("openssl after repo upgrade on %s: %s", node.hostname, upgraded)
+
+    if upgraded is None or upgraded < OPENSSL_MIN_VERSION:
+        log.warning(
+            "openssl still at %s on %s after repo attempt; falling back to UBI CDN",
+            upgraded,
+            node.hostname,
+        )
+        try:
+            _upgrade_openssl_from_cdn(node)
+        except Exception as exc:
+            log.error("UBI CDN openssl install failed on %s: %s", node.hostname, exc)
+        upgraded = _installed_openssl_version(node)
+        log.info("openssl after CDN upgrade on %s: %s", node.hostname, upgraded)
+
     if upgraded is None or upgraded < OPENSSL_MIN_VERSION:
         log.error(
             "openssl upgrade failed on %s: still at %s (need >= %s)",

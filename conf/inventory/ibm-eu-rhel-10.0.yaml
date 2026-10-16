@@ -34,51 +34,12 @@ instance:
         gpgcheck: false
         enabled: true
 
-    # write the mirror registry details
+    # write_files: sysctl/sshd/policy only (no Frankfurt registry mirror)
     write_files:
-      - content: |
-          [[registry]]
-          location = "nginx-vm-01.qe.ceph.lab:5000"
-          insecure = true
-
-          [[registry]]
-          location = "nginx-vm-01.qe.ceph.lab:5000/rh-stage"
-          prefix = "registry-proxy.engineering.redhat.com"
-          insecure = true
-
-          [[registry]]
-          location = "nginx-vm-01.qe.ceph.lab:5000/rh-stage"
-          prefix = "quay.io"
-          insecure = true
-
-          [[registry]]
-          location = "nginx-vm-01.qe.ceph.lab:5000/rh-stage"
-          prefix = "registry.stage.redhat.io"
-          insecure = true
-
-          [[registry]]
-          location = "nginx-vm-01.qe.ceph.lab:5000/rh-prod"
-          prefix = "registry.redhat.io"
-          insecure = true
-
-          [[registry]]
-          location = "nginx-vm-01.qe.ceph.lab:5000/ibm-stage"
-          prefix = "cp.stg.icr.io"
-          insecure = true
-
-          [[registry]]
-          location = "nginx-vm-01.qe.ceph.lab:5000/ibm-stage"
-          prefix = "preprod.icr.io"
-          insecure = true
-
-          [[registry]]
-          location = "nginx-vm-01.qe.ceph.lab:5000/ibm-prod"
-          prefix = "cp.icr.io"
-          insecure = true
-        path: /etc/containers/registries.conf.d/nginx-vm-01.conf
-        owner: root:root
-        permissions: '0644'
-        defer: true
+      # Container registries: do NOT mirror via nginx-vm-01 (Frankfurt).
+      # Shared by Dallas, London, and Madrid. VMs pull upstream hosts directly
+      # (preprod.icr.io, cp.icr.io, quay.io, registry.*.redhat.io).
+      # Auth uses bootstrap --registry-url / credentials (see #6124 / #6156).
       - content: |
           net.core.default_qdisc=netem
         path: /etc/sysctl.d/1000-qdisc.conf

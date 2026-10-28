@@ -22,7 +22,10 @@ from utility.odf_defaults import (
     apply_v2_only_mon_addrs,
     overrides_enabled,
 )
-from utility.registry_auth import PODMAN_AUTH_PATH
+from utility.registry_auth import (
+    PODMAN_AUTH_PATH,
+    merge_registry_into_podman_auth,
+)
 from utility.utils import resolve_registry_host, resolve_registry_login
 
 from ..ceph import CommandFailed, ResourceNotFoundError
@@ -351,6 +354,11 @@ class BootstrapMixin:
         registry_json = args.pop("registry-json", None)
         use_podman_auth = self.config.get("podman_auth_file")
 
+        if custom_image and isinstance(custom_image, str):
+            image_ref = custom_image
+        else:
+            image_ref = self.config.get("container_image")
+
         if use_podman_auth:
             logger.info(
                 "podman-auth-file is configured, skipping registry credentials "
@@ -358,11 +366,6 @@ class BootstrapMixin:
                 PODMAN_AUTH_PATH,
             )
         else:
-            if custom_image and isinstance(custom_image, str):
-                image_ref = custom_image
-            else:
-                image_ref = self.config.get("container_image")
-
             overrides = self.config.get("overrides") or {}
             registry_url = resolve_registry_host(
                 overrides=overrides,
@@ -380,10 +383,47 @@ class BootstrapMixin:
                     "No registry host resolved; "
                     "skipping registry credentials on bootstrap"
                 )
-            elif registry_json is not None:
-                cmd += construct_registry(self, registry_url, json_file=True)
             else:
-                cmd += construct_registry(self, registry_url)
+                # Ensure bootstrap registry is in cephadm's --authfile before
+                # pull. install_prereq may have seeded CDN-only auths; without
+                # the image host here, stage pulls fail in ~1s (RH sanity 1170).
+                try:
+                    reg_args = resolve_registry_login(registry_url)
+                    merge_registry_into_podman_auth(
+                        self.installer.node,
+                        registry_url,
+                        reg_args.get("registry-username"),
+                        reg_args.get("registry-password"),
+                    )
+                    # Surface real podman errors (auth vs missing tag) before
+                    # cephadm swallows them into a one-line Failed command.
+                    if image_ref and isinstance(image_ref, str):
+                        logger.info(
+                            "Pre-pulling bootstrap image via %s: %s",
+                            PODMAN_AUTH_PATH,
+                            image_ref,
+                        )
+                        self.installer.exec_command(
+                            sudo=True,
+                            cmd=(
+                                f"podman pull --authfile={PODMAN_AUTH_PATH} "
+                                f"{image_ref}"
+                            ),
+                            timeout=600,
+                            check_ec=True,
+                        )
+                except KeyError as err:
+                    logger.warning(
+                        "Could not merge bootstrap registry %s into %s: %s",
+                        registry_url,
+                        PODMAN_AUTH_PATH,
+                        err,
+                    )
+
+                if registry_json is not None:
+                    cmd += construct_registry(self, registry_url, json_file=True)
+                else:
+                    cmd += construct_registry(self, registry_url)
 
         # Generate dashboard certificate and key if bootstrap cli
         # have this options as dashboard-key and dashboard-crt

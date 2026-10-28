@@ -19,10 +19,12 @@ from cli.utilities.utils import (
     set_service_state,
 )
 from utility.log import Log
+from utility.registry_auth import write_podman_auth_file
 from utility.utils import (
     get_cephci_config,
     is_unsecured_registry,
     parse_custom_config_list,
+    registry_host_from_image,
     resolve_registry_login,
 )
 
@@ -305,10 +307,10 @@ def install_prereq(
             raise ConfigError("Firewall not active")
         log.info("Firewall is active")
 
-    # Login to CDN (+ optional custom-config) registries after any reboot
-    # (RHEL-8+ qdisc / FIPS) so docker/podman auth survives restarts and is
-    # present on every node before bootstrap / monitoring pulls.
-    registry_login(ceph, distro_ver, test_data, cloud_type=cloud_type)
+    # Login to CDN + bootstrap image host after any reboot (RHEL-8+ qdisc /
+    # FIPS) so docker/podman auth survives restarts and is present on every
+    # node before bootstrap / monitoring pulls.
+    registry_login(ceph, distro_ver, test_data, cloud_type=cloud_type, config=config)
 
     # Enable coredump collection
     enable_coredump(ceph)
@@ -509,13 +511,18 @@ CDN_REGISTRY_HOSTS = (
 )
 
 
-def registry_login(ceph, distro_ver, test_data=None, cloud_type="openstack"):
+def registry_login(
+    ceph, distro_ver, test_data=None, cloud_type="openstack", config=None
+):
     """
-    Login to CDN (+ optional run-specific) container registries on this node.
+    Login to CDN + bootstrap image host (+ optional custom-config) registries.
 
     Always attempts CDN hosts (``registry.redhat.io``, ``cp.icr.io``) so auth is
-    present before bootstrap / monitoring pulls. Additional hosts come from
-    --custom-config keys:
+    present before monitoring pulls. Also seeds the bootstrap image host from
+    ``config.container_image`` into ``/etc/ceph/podman-auth.json`` (cephadm's
+    ``--authfile``), which is separate from ``~/.docker/config.json``.
+
+    Additional hosts come from --custom-config keys:
       - bootstrap-registry
       - upgrade-registry
       - registries (comma-separated list)
@@ -525,6 +532,7 @@ def registry_login(ceph, distro_ver, test_data=None, cloud_type="openstack"):
     survive qdisc / FIPS restarts.
     """
     _ = cloud_type  # retained for call-site compatibility
+    config = config or {}
     container = "podman"
     if distro_ver.startswith("7"):
         container = "docker"
@@ -553,26 +561,48 @@ def registry_login(ceph, distro_ver, test_data=None, cloud_type="openstack"):
             if host:
                 explicit_hosts.add(host)
 
+    # Bootstrap / monitoring image hosts (best-effort).
+    inferred_hosts = set()
+    image_ref = config.get("container_image") or ""
+    image_host = registry_host_from_image(image_ref) or config.get(
+        "ceph_docker_registry"
+    )
+    if image_host:
+        inferred_hosts.add(str(image_host).strip())
+    for key, value in custom_dict.items():
+        if not key.endswith("_image") or not value:
+            continue
+        host = registry_host_from_image(str(value))
+        if host:
+            inferred_hosts.add(host)
+
     auths = {}
 
-    # CDN hosts: best-effort so missing YAML keys do not abort prereq.
-    for host in CDN_REGISTRY_HOSTS:
+    def _add_best_effort(host, label):
         try:
             reg_args = resolve_registry_login(host)
         except KeyError as err:
-            log.warning("Skipping CDN registry %s: %s", host, err)
-            continue
+            log.warning("Skipping %s registry %s: %s", label, host, err)
+            return
         user = reg_args.get("registry-username")
         passwd = reg_args.get("registry-password")
         if not user or not passwd:
             log.warning(
-                "Skipping CDN registry %s: username/password missing in cephci config",
+                "Skipping %s registry %s: username/password missing in cephci config",
+                label,
                 host,
             )
-            continue
+            return
         b64_auth = base64.b64encode(f"{user}:{passwd}".encode("ascii"))
         auths[host] = {"auth": b64_auth.decode("utf-8")}
-        log.info("Prepared CDN registry auth for %s", host)
+        log.info("Prepared %s registry auth for %s", label, host)
+
+    for host in CDN_REGISTRY_HOSTS:
+        _add_best_effort(host, "CDN")
+    for host in sorted(inferred_hosts):
+        if host in auths:
+            continue
+        _add_best_effort(host, "image")
 
     # Explicit hosts from custom-config (required when requested).
     for host in sorted(explicit_hosts):
@@ -620,6 +650,11 @@ def registry_login(ceph, distro_ver, test_data=None, cloud_type="openstack"):
         file.write(json.dumps(auths_dict, indent=4))
         file.flush()
         file.close()
+
+    # Cephadm uses --authfile=/etc/ceph/podman-auth.json (not docker config).
+    # Skip when an explicit ODF podman-auth-file will be distributed next.
+    if not config.get("podman_auth_file"):
+        write_podman_auth_file(ceph, auths)
 
     log.info(
         "Registry login written on %s for: %s",

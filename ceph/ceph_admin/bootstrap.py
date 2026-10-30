@@ -25,6 +25,7 @@ from utility.odf_defaults import (
 from utility.registry_auth import PODMAN_AUTH_PATH
 from utility.utils import (
     ibm_ceph_rpm_version_pin,
+    normalize_container_image,
     resolve_registry_host,
     resolve_registry_login,
 )
@@ -337,9 +338,12 @@ class BootstrapMixin:
 
         if custom_image:
             if isinstance(custom_image, str):
-                cmd += f" --image {custom_image}"
+                image_ref = normalize_container_image(custom_image)
             else:
-                cmd += f" --image {self.config['container_image']}"
+                image_ref = normalize_container_image(
+                    self.config.get("container_image")
+                )
+            cmd += f" --image {image_ref}"
 
         cmd += " bootstrap"
 
@@ -363,9 +367,11 @@ class BootstrapMixin:
             )
         else:
             if custom_image and isinstance(custom_image, str):
-                image_ref = custom_image
+                image_ref = normalize_container_image(custom_image)
             else:
-                image_ref = self.config.get("container_image")
+                image_ref = normalize_container_image(
+                    self.config.get("container_image")
+                )
 
             overrides = self.config.get("overrides") or {}
             registry_url = resolve_registry_host(
@@ -508,7 +514,7 @@ class BootstrapMixin:
                 if not key.endswith("_image"):
                     continue
 
-                images_dict[key] = value
+                images_dict[key] = normalize_container_image(value)
 
         ignore_images = ["cephcsi", "nvmeof_cli", "crimson"]
         check_ignored_images = lambda image: image in ignore_images
@@ -516,6 +522,7 @@ class BootstrapMixin:
             _image = image.removesuffix("_image")
             if check_ignored_images(_image):
                 continue
+            value = normalize_container_image(value)
             cmd = "cephadm shell -- ceph config set mgr"
             cmd += f" mgr/cephadm/container_image_{_image} {value}"
             self.installer.exec_command(sudo=True, cmd=cmd)

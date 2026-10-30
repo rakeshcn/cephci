@@ -384,10 +384,24 @@ class BootstrapMixin:
                     "No registry host resolved; "
                     "skipping registry credentials on bootstrap"
                 )
-            elif registry_json is not None:
-                cmd += construct_registry(self, registry_url, json_file=True)
             else:
-                cmd += construct_registry(self, registry_url)
+                # Public hosts (e.g. quay.io/rhceph-ci digests) need no login.
+                # Missing registries: entry must not abort bootstrap — pull anonymously.
+                try:
+                    if registry_json is not None:
+                        cmd += construct_registry(
+                            self, registry_url, json_file=True
+                        )
+                    else:
+                        cmd += construct_registry(self, registry_url)
+                except KeyError as err:
+                    logger.warning(
+                        "No credentials for registry %r in ~/.cephci.yaml (%s); "
+                        "bootstrapping without registry login "
+                        "(anonymous/public pull)",
+                        registry_url,
+                        err,
+                    )
 
         # Generate dashboard certificate and key if bootstrap cli
         # have this options as dashboard-key and dashboard-crt

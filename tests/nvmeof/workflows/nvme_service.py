@@ -59,6 +59,8 @@ class NVMeService:
         )
         if self.inband_auth_mode:
             self.is_spec_or_mtls = True
+        self.service_name = None
+        self.service_id = None
 
     def _get_ceph_version(self):
         return get_ceph_version_from_cluster(self.clients[0])
@@ -154,9 +156,8 @@ class NVMeService:
                     raise ValueError("Gateway group not provided for RHCS 8+")
 
                 if self.is_spec_or_mtls:
-                    cfg["config"]["specs"][0][
-                        "service_id"
-                    ] = f"{self.nvme_metadata_pool}.{self.group}"
+                    pool_id = self.nvme_metadata_pool.lstrip(".")
+                    cfg["config"]["specs"][0]["service_id"] = f"{pool_id}.{self.group}"
                     cfg["config"]["specs"][0]["spec"]["group"] = self.group
                 else:
                     if LooseVersion(self.ceph_version) >= LooseVersion("20.2.1"):
@@ -266,6 +267,30 @@ class NVMeService:
 
         return placement
 
+    def _discover_service_name(self):
+        """Discover NVMeoF orchestrator service name/id when not deployed by this test."""
+        if self.service_name:
+            return
+
+        ceph = Orch(self.ceph_cluster, **{})
+        cmd = "ceph orch ls nvmeof --format json"
+        out, _ = ceph.shell(args=[cmd])
+        services = json.loads(out)
+        for service in services:
+            if "nvmeof" not in service["service_name"]:
+                continue
+            if self.group:
+                if not service["service_name"].endswith(f".{self.group}"):
+                    continue
+            self.service_name = service["service_name"]
+            self.service_id = service["service_id"]
+            LOG.info(
+                "Discovered NVMeoF service name: %s, service id: %s",
+                self.service_name,
+                self.service_id,
+            )
+            return
+
     def deploy(self):
         """
         Deploy NVMe gateways using orchestrator, then fetch and update daemon and service names for each gateway node.
@@ -280,36 +305,7 @@ class NVMeService:
         if deploy_config:
             test_nvmeof.run(self.ceph_cluster, **deploy_config)
 
-        # Once the service is deployed, get the service name and service id and store it
-        ceph = Orch(self.ceph_cluster, **{})
-        cmd = "ceph orch ls nvmeof --format json"
-        out, _ = ceph.shell(args=[cmd])
-        services = json.loads(out)
-        self.service_name = None
-        self.service_id = None
-        for service in services:
-            # If we have multiple services in single cluster then we need to filter the service by group
-            # so that we will get the correct service name and service id for the group.
-            # when we take services[0]["service_name"] only first service name will be returned
-            # so we need to filter the service by group.
-            if "nvmeof" in service["service_name"]:
-                if self.group:
-                    if self.group in service["service_name"]:
-                        service_name = service["service_name"]
-                        service_id = service["service_id"]
-                        LOG.info(
-                            f"Service name: {service_name}, Service id: {service_id}"
-                        )
-                        self.service_name = service_name
-                        self.service_id = service_id
-                        break
-                else:
-                    service_name = service["service_name"]
-                    service_id = service["service_id"]
-                    LOG.info(f"Service name: {service_name}, Service id: {service_id}")
-                    self.service_name = service_name
-                    self.service_id = service_id
-                    break
+        self._discover_service_name()
 
     def redeploy(self, wait_sec=30):
         """Redeploy the NVMe-oF orchestrator service after spec apply."""
@@ -322,23 +318,200 @@ class NVMeService:
         if wait_sec:
             time.sleep(wait_sec)
 
-    def init_gateways(self):
+    def wait_for_gateways_ready(self, timeout=300, interval=10):
+        """Poll each gateway until gateway_initialization_over is True.
+
+        Must be called after init_gateways() so that self.gateways is populated.
+
+        Args:
+            timeout (int): Maximum seconds to wait per gateway (default 300).
+            interval (int): Poll interval in seconds (default 10).
+
+        Raises:
+            RuntimeError: If any gateway does not become ready within timeout.
+        """
+        if not getattr(self, "gateways", None):
+            raise RuntimeError("Gateways not initialised; call init_gateways() first")
+
+        for gw in self.gateways:
+            hostname = gw.node.hostname
+            deadline = time.time() + timeout
+            LOG.info(
+                "Waiting for gateway %s to be ready (timeout=%ds)", hostname, timeout
+            )
+            while time.time() < deadline:
+                try:
+                    out, _ = gw.gateway.info(**{"base_cmd_args": {"format": "json"}})
+                    info = json.loads(out)
+                    if info.get("gateway_initialization_over"):
+                        LOG.info("Gateway %s is ready", hostname)
+                        break
+                except Exception as exc:
+                    LOG.debug("gateway info on %s raised %s — retrying", hostname, exc)
+                time.sleep(interval)
+            else:
+                raise RuntimeError(
+                    f"Gateway {hostname} did not become ready within {timeout}s"
+                )
+
+    def register_dashboard_nvmeof_gateways(self):
+        """Register running NVMe-oF daemons with dashboard so ``ceph nvmeof`` works.
+
+        Bootstrap with skip-dashboard leaves ``ceph dashboard nvmeof-gateway-list``
+        empty; the CLI then fails with "Gateway group does not exist".
+        """
+        orch = Orch(self.ceph_cluster, **{})
+        out, _ = orch.shell(args=["ceph", "dashboard", "nvmeof-gateway-list"])
+        try:
+            listed = json.loads(out)
+        except (TypeError, json.JSONDecodeError):
+            listed = {}
+        if listed.get("gateways"):
+            LOG.info("Dashboard already has NVMe-oF gateways registered")
+            return
+
+        out, _ = orch.shell(
+            args=["ceph", "orch", "ps", "--daemon_type", "nvmeof", "--format", "json"]
+        )
+        daemons = json.loads(out)
+        installer = getattr(orch.installer, "node", orch.installer)
+        port = getattr(self, "port", DEFAULT_PORT)
+        url_file = "/tmp/nvmeof-dashboard-gw.url"
+
+        for daemon in daemons:
+            service_name = daemon.get("service_name") or ""
+            daemon_name = daemon.get("daemon_name") or daemon.get("daemon_id") or ""
+            hostname = daemon.get("hostname") or ""
+            if (
+                self.group
+                and self.group not in service_name
+                and self.group not in daemon_name
+            ):
+                continue
+            node = None
+            for gw in self.gw_nodes:
+                names = {
+                    gw.hostname,
+                    getattr(gw, "shortname", ""),
+                    getattr(gw, "id", ""),
+                }
+                if hostname in names or any(n and n in hostname for n in names if n):
+                    node = gw
+                    break
+            if not node:
+                LOG.warning(
+                    "No gateway node match to register with dashboard: %s", hostname
+                )
+                continue
+            url = f"{node.ip_address}:{port}"
+            installer.exec_command(
+                sudo=True, cmd=f"printf '%s\\n' '{url}' > {url_file}"
+            )
+            # Dashboard looks up orch.services.get(name); name must be the
+            # nvmeof service name (e.g. nvmeof.nvmeof.gw_group1), not hostname.
+            dash_name = service_name or hostname
+            args = ["ceph", "dashboard", "nvmeof-gateway-add", dash_name]
+            if self.group:
+                args.append(self.group)
+            if daemon_name:
+                args.append(daemon_name)
+            args.extend(["-i", url_file])
+            LOG.info(
+                "Registering dashboard NVMe-oF gateway %s (%s) -> %s",
+                dash_name,
+                hostname,
+                url,
+            )
+            orch.shell(args=args, base_cmd_args={"mount": "/tmp:/tmp"})
+
+        out, _ = orch.shell(args=["ceph", "dashboard", "nvmeof-gateway-list"])
+        LOG.info("Dashboard NVMe-oF gateway list: %s", out)
+
+    def init_gateways(self, timeout=300, interval=10):
         """
         Initialize NVMeGateway objects for each ceph_node in the group.
+
+        Retries create_gateway() until the gateway responds (handles the window
+        where the daemon is still starting after a redeploy).
+
+        Args:
+            timeout (int): Max seconds to wait per node (default 300).
+            interval (int): Retry interval in seconds (default 10).
         """
+        self.register_dashboard_nvmeof_gateways()
         self.gateways = []
         port = getattr(self, "port", DEFAULT_PORT)
-
         ceph = Orch(self.ceph_cluster, **{})
+        version = nvme_gw_cli_version_adapter(self.ceph_cluster)
 
         for node in self.gw_nodes:
-            self.gateways.append(
-                create_gateway(
-                    nvme_gw_cli_version_adapter(self.ceph_cluster),
-                    node,
-                    mtls=self.mtls,
-                    shell=getattr(ceph, "shell"),
-                    port=port,
-                    gw_group=self.group,
-                )
-            )
+            deadline = time.time() + timeout
+            LOG.info("Initialising gateway %s (timeout=%ds)", node.hostname, timeout)
+            while True:
+                try:
+                    gw = create_gateway(
+                        version,
+                        node,
+                        mtls=self.mtls,
+                        shell=getattr(ceph, "shell"),
+                        port=port,
+                        gw_group=self.group,
+                    )
+                    self._sync_gateway_identity(gw)
+                    self.gateways.append(gw)
+                    LOG.info("Gateway %s initialised", node.hostname)
+                    break
+                except Exception as exc:
+                    if time.time() >= deadline:
+                        raise RuntimeError(
+                            f"Gateway {node.hostname} did not become reachable "
+                            f"within {timeout}s"
+                        ) from exc
+                    LOG.debug(
+                        "Gateway %s not ready yet (%s) — retrying in %ds",
+                        node.hostname,
+                        exc,
+                        interval,
+                    )
+                    time.sleep(interval)
+        self._discover_service_name()
+
+    def _sync_gateway_identity(self, gw):
+        """Overlay orch / nvme-gw identity when dashboard returns the first GW in the group."""
+        orch = Orch(self.ceph_cluster, **{})
+        out, _ = orch.shell(
+            args=["ceph", "orch", "ps", "--daemon_type", "nvmeof", "--format", "json"]
+        )
+        daemons = json.loads(out) if isinstance(out, str) else out
+        if isinstance(daemons, str):
+            start, end = daemons.find("["), daemons.rfind("]")
+            daemons = json.loads(daemons[start : end + 1]) if start != -1 else []
+        hostname = gw.node.hostname
+        for daemon in daemons:
+            dhost = daemon.get("hostname") or ""
+            if hostname == dhost or hostname in dhost or dhost in hostname:
+                daemon_name = daemon.get("daemon_name")
+                if daemon_name:
+                    gw.daemon_name = daemon_name
+                    gw.gw_id = (
+                        daemon_name
+                        if str(daemon_name).startswith("client.")
+                        else f"client.{daemon_name}"
+                    )
+                break
+        try:
+            from cli.ceph.nvme_gw import NvmeGw
+
+            nvme_gw = NvmeGw(orch.installer, "ceph")
+            show = nvme_gw.show(self.nvme_metadata_pool, self.group, format="json")
+            text = show if isinstance(show, str) else str(show)
+            start, end = text.find("{"), text.rfind("}")
+            data = json.loads(text[start : end + 1]) if start != -1 else {}
+            for item in data.get("Created Gateways:", data.get("gateways", [])):
+                gid = item.get("gw-id") or ""
+                if gw.gw_id == gid or hostname in gid:
+                    if item.get("anagrp-id") is not None:
+                        gw.ana_group_id = item["anagrp-id"]
+                    break
+        except Exception as exc:
+            LOG.debug("Could not sync ANA group from nvme-gw show: %s", exc)

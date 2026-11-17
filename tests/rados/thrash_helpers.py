@@ -23,6 +23,9 @@ import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
+from ceph.rados.core_workflows import RadosOrchestrator
+from ceph.rados.mgr_workflows import MgrWorkflows
+from ceph.rados.monitor_workflows import MonitorWorkflows
 from ceph.waiter import WaitUntil
 from cli.utilities.utils import reboot_node
 from utility.log import Log
@@ -493,7 +496,7 @@ class NfsThrashWorkflows:
         """
         result = {"valid": False, "error": None, "size": 0}
         try:
-            out = self.installer.exec_command(
+            out = self.rados_obj.client.exec_command(
                 sudo=True,
                 cmd=f"rados get -p .nfs -N {cluster_id} "
                 f"conf-nfs.{cluster_id} /dev/stdout 2>/dev/null",
@@ -841,7 +844,7 @@ class SmbThrashWorkflows:
         result = {"valid": [], "corrupted": [], "details": {}}
         for cid in cluster_ids:
             try:
-                out = self.installer.exec_command(
+                out = self.rados_obj.client.exec_command(
                     sudo=True,
                     cmd=f"rados --pool=.smb -N {cid} get cluster.meta.json /dev/stdout",
                     timeout=15,
@@ -1083,6 +1086,83 @@ def _export_pseudo(export_entry) -> str:
         export_entry
         if isinstance(export_entry, str)
         else export_entry.get("pseudo", "")
+    )
+
+
+def _nfs_churn_export_create_cmd(nfs_config, cluster_id, pseudo, fs_name) -> str:
+    """Build export create. PEC: exact ``sv_path`` only (never ``--path=/``)."""
+    if not nfs_config.get("enable_pec"):
+        return (
+            f"ceph nfs export create cephfs {cluster_id} {pseudo} "
+            f"{fs_name} --path=/"
+        )
+
+    sv_path = None
+    for entry in nfs_config.get("exports") or []:
+        if (
+            entry.get("cluster_id") == cluster_id
+            and entry.get("pseudo_path") == pseudo
+            and entry.get("sv_path")
+        ):
+            sv_path = entry["sv_path"]
+            break
+    if not sv_path:
+        raise RuntimeError(f"PEC enabled but no sv_path for {cluster_id}:{pseudo}")
+    return (
+        f"ceph nfs export create cephfs {cluster_id} {pseudo} {fs_name} "
+        f"--path={sv_path} --cmount_path={sv_path}"
+    )
+
+
+def _nfs_pec_provision_churn_export(installer, nfs_config, cluster_id, pseudo, fs_name):
+    """Create a dedicated subvolume for a new PEC churn export; register in config.
+
+    Returns ``(sv_name, svg)`` for caller cleanup after ``export rm``.
+    """
+    svg = nfs_config.get("pec_svg") or "pecgroup"
+    # Unique name: pseudo is /churn_export_N
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", pseudo.strip("/"))
+    sv_name = f"nfsvol_{safe}"
+    installer.exec_command(
+        sudo=True,
+        cmd=(
+            f"ceph fs subvolume create {fs_name} {sv_name} "
+            f"--group_name {svg} --namespace-isolated"
+        ),
+        timeout=60,
+    )
+    sv_path, _ = installer.exec_command(
+        sudo=True,
+        cmd=f"ceph fs subvolume getpath {fs_name} {sv_name} --group_name {svg}",
+        timeout=30,
+    )
+    sv_path = (sv_path or "").strip()
+    if not sv_path:
+        raise RuntimeError(f"empty getpath for churn SV {sv_name}")
+    nfs_config.setdefault("exports", []).append(
+        {
+            "cluster_id": cluster_id,
+            "pseudo_path": pseudo,
+            "fs_name": fs_name,
+            "sv_name": sv_name,
+            "svg": svg,
+            "sv_path": sv_path,
+        }
+    )
+    return sv_name, svg
+
+
+def _nfs_pec_rm_subvolume(installer, fs_name, sv_name, svg):
+    """Best-effort remove a PEC churn subvolume."""
+    if not (fs_name and sv_name and svg):
+        return
+    installer.exec_command(
+        sudo=True,
+        cmd=(
+            f"ceph fs subvolume rm {fs_name} {sv_name} " f"--group_name {svg} --force"
+        ),
+        timeout=60,
+        check_ec=False,
     )
 
 
@@ -1469,7 +1549,9 @@ def thrash_nfs_export_churn(
 
     Randomly selects one of three operations each cycle:
         - ``create``: create a new churn export then immediately delete it.
-        - ``delete_recreate``: delete a non-churn export and recreate it.
+          With PEC, provisions a dedicated subvolume (never ``--path=/``).
+        - ``delete_recreate``: delete a non-churn export and recreate it
+          (PEC recreates with the same ``sv_path`` from ``nfs_config``).
         - ``modify_access``: toggle ``access_type`` between RW and RO via
           ``ceph nfs export apply``.
 
@@ -1502,21 +1584,41 @@ def thrash_nfs_export_churn(
             if op == "create":
                 pseudo = f"/churn_export_{churn_export_idx}"
                 churn_export_idx += 1
-                installer.exec_command(
-                    sudo=True,
-                    cmd=f"ceph nfs export create cephfs {cluster_id} "
-                    f"{pseudo} {fs_name} --path=/",
-                    timeout=30,
-                )
-                result["creates"] += 1
-                _sleep_with_stop(stop_flag, total_seconds=3, step=1)
-                installer.exec_command(
-                    sudo=True,
-                    cmd=f"ceph nfs export rm {cluster_id} {pseudo}",
-                    timeout=30,
-                    check_ec=False,
-                )
-                result["deletes"] += 1
+                churn_sv = None
+                churn_svg = None
+                try:
+                    if nfs_config.get("enable_pec"):
+                        churn_sv, churn_svg = _nfs_pec_provision_churn_export(
+                            installer, nfs_config, cluster_id, pseudo, fs_name
+                        )
+                    installer.exec_command(
+                        sudo=True,
+                        cmd=_nfs_churn_export_create_cmd(
+                            nfs_config, cluster_id, pseudo, fs_name
+                        ),
+                        timeout=30,
+                    )
+                    result["creates"] += 1
+                    _sleep_with_stop(stop_flag, total_seconds=3, step=1)
+                    installer.exec_command(
+                        sudo=True,
+                        cmd=f"ceph nfs export rm {cluster_id} {pseudo}",
+                        timeout=30,
+                        check_ec=False,
+                    )
+                    result["deletes"] += 1
+                finally:
+                    if churn_sv:
+                        exports = nfs_config.get("exports") or []
+                        nfs_config["exports"] = [
+                            e
+                            for e in exports
+                            if not (
+                                e.get("cluster_id") == cluster_id
+                                and e.get("pseudo_path") == pseudo
+                            )
+                        ]
+                        _nfs_pec_rm_subvolume(installer, fs_name, churn_sv, churn_svg)
 
             elif op == "delete_recreate":
                 exports = _list_cluster_exports(rados_obj, cluster_id)
@@ -1535,8 +1637,9 @@ def thrash_nfs_export_churn(
                         _sleep_with_stop(stop_flag, total_seconds=2, step=1)
                         installer.exec_command(
                             sudo=True,
-                            cmd=f"ceph nfs export create cephfs {cluster_id} "
-                            f"{pseudo} {fs_name} --path=/",
+                            cmd=_nfs_churn_export_create_cmd(
+                                nfs_config, cluster_id, pseudo, fs_name
+                            ),
                             timeout=30,
                         )
                         result["creates"] += 1
@@ -1935,3 +2038,328 @@ def thrash_smb_client_io(
         "[smb_io] Completed: io_ops=%s, errors=%s", result["io_ops"], result["errors"]
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+#  Common Daemon Kill Helper
+# ---------------------------------------------------------------------------
+
+
+def _kill_daemon(
+    rados_obj: RadosOrchestrator,
+    daemon_type: str,
+    daemon_id: str,
+    cluster_fsid: str,
+) -> bool:
+    """Send a random kill signal (SIGKILL or SIGTERM) to a specific Ceph daemon.
+
+    Randomly selects between SIGKILL (abrupt crash, no cleanup) and SIGTERM
+    (graceful shutdown) to simulate varied real-world failure scenarios.
+    Uses ``systemctl kill --signal=<SIG> ceph-{fsid}@{type}.{id}.service``
+    to precisely target a single daemon process, regardless of daemon type.
+
+    Args:
+        rados_obj: RadosOrchestrator for host resolution.
+        daemon_type: Ceph daemon type (``"osd"``, ``"mon"``, ``"mgr"``).
+        daemon_id: Daemon identifier (e.g. ``"0"`` for osd.0, hostname
+            for mon).
+        cluster_fsid: Pre-fetched cluster FSID (avoids per-call ``ceph fsid``
+            overhead).
+
+    Returns:
+        True if the kill command succeeded, False on error.
+    """
+    signal = random.choice(["SIGKILL", "SIGTERM"])
+    try:
+        host = rados_obj.fetch_host_node(
+            daemon_type=daemon_type, daemon_id=str(daemon_id)
+        )
+        if not host:
+            log.warning("Could not resolve host for %s.%s", daemon_type, daemon_id)
+            return False
+
+        service_name = f"ceph-{cluster_fsid}@{daemon_type}.{daemon_id}.service"
+
+        log.info(
+            "Sending %s to %s.%s via systemctl kill on %s (service: %s)",
+            signal,
+            daemon_type,
+            daemon_id,
+            host.hostname,
+            service_name,
+        )
+        host.exec_command(
+            sudo=True,
+            cmd=f"systemctl kill --signal={signal} {service_name}",
+        )
+        return True
+
+    except Exception as e:
+        log.warning("Failed to %s %s.%s: %s", signal, daemon_type, daemon_id, e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+#  OSD SIGKILL/SIGTERM thrashing
+# ---------------------------------------------------------------------------
+
+
+def thrash_osd_sigkill(
+    rados_obj: RadosOrchestrator,
+    osd_list: List[int],
+    iterations: int,
+    stop_flag: Dict,
+    cluster_fsid: str,
+) -> int:
+    """
+    Thrash OSDs by sending SIGKILL/SIGTERM to simulate abrupt daemon crashes.
+
+    Per iteration:
+    1. Select 1-2 random OSDs
+    2. Resolve each OSD's host via ``ceph orch ps``
+    3. Send a randomly chosen signal (SIGKILL or SIGTERM) to the ceph-osd process
+    4. Wait for orchestrator to auto-restart the daemon
+    5. Verify the OSD comes back up
+
+    Unlike the graceful out/in thrashing, SIGKILL bypasses all OSD shutdown
+    handlers (journal flush, PG state persistence), creating conditions that
+    stress PG peering, journal replay, and BlueStore recovery on startup.
+    SIGTERM allows cleanup handlers to run, simulating graceful termination.
+
+    Args:
+        rados_obj: RadosOrchestrator object
+        osd_list: List of OSD IDs eligible for thrashing
+        iterations: Number of thrashing iterations
+        stop_flag: Dict with 'stop' key to signal early termination
+        cluster_fsid: Pre-fetched cluster FSID (avoids per-call ``ceph fsid``
+            overhead).
+
+    Returns:
+        Number of iterations completed
+    """
+    log.info(
+        "Starting OSD SIGKILL thrashing " "(iterations: %s, osd_list: %s, fsid: %s)",
+        iterations,
+        osd_list,
+        cluster_fsid,
+    )
+    completed = 0
+
+    for iteration in range(iterations):
+        if stop_flag.get("stop"):
+            break
+
+        num_to_kill = min(random.randint(1, 2), len(osd_list))
+        target_osds = random.sample(osd_list, num_to_kill)
+
+        log.info(
+            "SIGKILL iteration %s/%s: Targeting OSD(s) %s",
+            iteration + 1,
+            iterations,
+            target_osds,
+        )
+
+        killed = []
+        for osd_id in target_osds:
+            if _kill_daemon(rados_obj, "osd", str(osd_id), cluster_fsid):
+                killed.append(osd_id)
+
+        if not killed:
+            log.warning("No OSDs were killed in iteration %s", iteration + 1)
+            time.sleep(5)
+            continue
+
+        # Poll for OSD recovery (up to 60s, every 5s) instead of a
+        # single hard-wait
+        all_up = False
+        still_down = list(killed)
+        for elapsed in range(5, 65, 5):
+            try:
+                up_osds = rados_obj.get_osd_list(status="up")
+                if not up_osds:
+                    log.error("No UP OSDs found in the cluster")
+                    time.sleep(5)
+                    continue
+                still_down = [oid for oid in killed if oid not in up_osds]
+                if not still_down:
+                    all_up = True
+                    break
+                log.debug(
+                    "OSD recovery poll %ss: still down %s",
+                    elapsed,
+                    still_down,
+                )
+            except Exception:
+                log.debug("OSD recovery poll %ss: osd dump failed", elapsed)
+            time.sleep(5)
+
+        for osd_id in killed:
+            if all_up or osd_id not in still_down:
+                log.info("OSD.%s is up after SIGKILL/SIGTERM", osd_id)
+            else:
+                log.warning(
+                    "OSD.%s is NOT up after SIGKILL/SIGTERM(may still be recovering)",
+                    osd_id,
+                )
+
+        completed += 1
+        time.sleep(random.uniform(5, 10))
+
+    log.info("OSD SIGKILL thrashing completed: %s iterations", completed)
+    return completed
+
+
+# ---------------------------------------------------------------------------
+#  MON and MGR SIGKILL/SIGTERM Thrashing
+# ---------------------------------------------------------------------------
+
+
+def thrash_mon_sigkill(
+    rados_obj: RadosOrchestrator, mon_workflow_obj: MonitorWorkflows, cluster_fsid: str
+) -> bool:
+    """
+    Kill a random MON daemon with SIGKILL/SIGTERM to simulate an abrupt crash.
+
+    Delegates the actual kill to ``_kill_daemon`` which uses
+    ``systemctl kill --signal=<SIGKILL|SIGTERM>`` to precisely target the MON
+    service.
+
+    Args:
+        rados_obj: RadosOrchestrator instance.
+        mon_workflow_obj: MonitorWorkflows instance.
+        cluster_fsid: Pre-fetched cluster FSID (avoids per-call overhead).
+        recovery_timeout: Seconds to wait for the MON to rejoin quorum
+            (default: 120).
+    """
+    try:
+        quorum_hosts = mon_workflow_obj.get_mon_quorum_hosts()
+        if len(quorum_hosts) < 3:
+            log.warning(
+                "Need at least 3 MONs in quorum for kill thrash have %s",
+                len(quorum_hosts),
+            )
+            return False
+
+        target_mon = random.choice(quorum_hosts)
+
+        if not _kill_daemon(rados_obj, "mon", target_mon, cluster_fsid):
+            return False
+
+        host = rados_obj.fetch_host_node(daemon_type="mon", daemon_id=str(target_mon))
+        service_name = f"ceph-{cluster_fsid}@mon.{target_mon}.service"
+        host.exec_command(
+            sudo=True,
+            cmd=f"systemctl restart {service_name}",
+        )
+
+        # Poll for quorum re-entry (every 10s, up to recovery_timeout)
+        poll_interval = 10
+        recovery_timeout = 120
+        for elapsed in range(
+            poll_interval, recovery_timeout + poll_interval, poll_interval
+        ):
+            try:
+                quorum_after = mon_workflow_obj.get_mon_quorum_hosts()
+                if target_mon in quorum_after:
+                    log.info(
+                        "MON %s rejoined quorum after %ss",
+                        target_mon,
+                        elapsed,
+                    )
+                    return True
+                log.debug(
+                    "MON recovery poll %ss/%ss: %s not yet in quorum %s",
+                    elapsed,
+                    recovery_timeout,
+                    target_mon,
+                    quorum_after,
+                )
+            except Exception:
+                log.debug("MON recovery poll %ss: quorum query failed", elapsed)
+            time.sleep(poll_interval)
+
+        quorum_after = mon_workflow_obj.get_mon_quorum_hosts()
+        log.warning(
+            "MON %s did not rejoin quorum within %ss. Current quorum: %s",
+            target_mon,
+            recovery_timeout,
+            quorum_after,
+        )
+        return False
+
+    except Exception as e:
+        log.error("MON sigkill thrash failed: %s", e)
+        return False
+
+
+def thrash_mgr_sigkill(
+    rados_obj: RadosOrchestrator,
+    mgr_workflow_obj: MgrWorkflows,
+    cluster_fsid: str,
+    recovery_timeout: int = 120,
+) -> bool:
+    """
+     Selects a random MGR (active or standby) and verifies an active
+    MGR is available post-kill.
+
+    Args:
+        rados_obj: RadosOrchestrator instance.
+        mgr_workflow_obj: MgrWorkflows instance.
+        cluster_fsid: Pre-fetched cluster FSID (avoids per-call overhead).
+        recovery_timeout: Seconds to wait for an active MGR to appear
+            (default: 120).
+    """
+    try:
+        mgr_list = mgr_workflow_obj.get_mgr_daemon_list()
+        if len(mgr_list) < 2:
+            log.warning("Need at least 2 MGRs for sigkill thrash")
+            return False
+
+        target_mgr = random.choice(mgr_list)
+        active_mgr = mgr_workflow_obj.get_active_mgr()
+        mgr_type = "active" if target_mgr == active_mgr else "standby"
+        log.info("Selected %s MGR %s for SIGKILL", mgr_type, target_mgr)
+
+        if not _kill_daemon(rados_obj, "mgr", target_mgr, cluster_fsid):
+            return False
+
+        host = rados_obj.fetch_host_node(daemon_type="mgr", daemon_id=str(target_mgr))
+        service_name = f"ceph-{cluster_fsid}@mgr.{target_mgr}.service"
+        host.exec_command(
+            sudo=True,
+            cmd=f"systemctl restart {service_name}",
+        )
+
+        # Poll for an active MGR (every 10s, up to recovery_timeout)
+        poll_interval = 10
+        recovery_timeout = 120
+        for elapsed in range(
+            poll_interval, recovery_timeout + poll_interval, poll_interval
+        ):
+            try:
+                new_active = mgr_workflow_obj.get_active_mgr()
+                if new_active:
+                    log.info(
+                        "MGR cluster healthy after SIGKILL of %s. Active MGR: %s (recovered in %ss)",
+                        target_mgr,
+                        new_active,
+                        elapsed,
+                    )
+                    return True
+                log.debug(
+                    "MGR recovery poll %ss/%ss: no active MGR yet",
+                    elapsed,
+                    recovery_timeout,
+                )
+            except Exception:
+                log.debug("MGR recovery poll %ss: mgr query failed", elapsed)
+            time.sleep(poll_interval)
+
+        log.warning(
+            "No active MGR after SIGKILL of %s within %ss", target_mgr, recovery_timeout
+        )
+        return False
+
+    except Exception as e:
+        log.error("MGR sigkill thrash failed: %s", e)
+        return False

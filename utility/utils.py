@@ -69,6 +69,57 @@ class GKLMSetupError(Exception):
     pass
 
 
+def get_rhbuild_major_version(rhbuild) -> int:
+    """Return RHCS major version as int from an rhbuild string.
+
+    Examples:
+        ``"10.0-rhel-10"`` -> ``10``
+        ``"5.3"`` -> ``5``
+        ``"4"`` -> ``4``
+
+    Avoid string compares like ``rhbuild.split(".")[0] >= "5"`` (``"10" >= "5"``
+    is False) and ``int(rhbuild[0])`` (``"10.x"`` becomes ``1``).
+
+    Empty or malformed values return ``0`` so version gates fail closed, and a
+    warning is logged so silent skips are visible.
+    """
+    if not rhbuild:
+        log.warning(
+            "Unable to parse rhbuild major version from %r; defaulting to 0",
+            rhbuild,
+        )
+        return 0
+    match = re.search(r"^\d+", str(rhbuild).strip())
+    if not match:
+        log.warning(
+            "Unable to parse rhbuild major version from %r; defaulting to 0",
+            rhbuild,
+        )
+        return 0
+    return int(match.group(0))
+
+
+def ibm_ceph_rpm_version_pin(ceph_version: str, os_major: str) -> str:
+    """Build yum NEVRA suffix for IBM Storage Ceph RPMs (cephadm, ceph-common, …).
+
+    IBM Storage Ceph RPMs use epoch ``2`` and the ``.elNcp`` dist tag across
+    Tentacle and Umbrella builds, e.g. ``2:20.2.2-351.el10cp`` and
+    ``2:21.1.1-9.el10cp``. Community / upstream packages may omit epoch and
+    ``cp``; those paths use a different pin (``VR*``) and do not call this
+    helper.
+
+    Args:
+        ceph_version: Version-release without dist tag (e.g. ``21.1.1-9``).
+        os_major: RHEL major from platform (e.g. ``10`` from ``rhel-10``).
+
+    Returns:
+        String suitable for ``yum install <pkg>-<pin>``.
+    """
+    ver = (ceph_version or "").strip()
+    major = (os_major or "").strip()
+    return f"2:{ver}.el{major}cp"
+
+
 def config_dict_to_string(data: Dict) -> str:
     """
     Convert the provided data to a string of optional arguments.
@@ -576,6 +627,62 @@ def check_ceph_status(site):
         )
 
 
+def _wait_for_osd_and_rgw_ready(node, timeout=600, interval=10):
+    """Wait until OSDs and RGW restarted by set_config_param are serving again.
+
+    ``ceph orch restart osd.all-available-devices`` leaves OSDs down on 9.1.
+    The next multisite user-create then hits ``(2200) Unknown error 2200``
+    (failed to fetch master sync status) while those OSDs and PGs are still out.
+    """
+    end = time.time() + timeout
+    last_msg = ""
+    attempts = 0
+    while time.time() < end:
+        attempts += 1
+        try:
+            osd_out, _ = node.exec_command(cmd="ceph osd stat --format json")
+            stats = json.loads(osd_out)
+            up = int(stats.get("num_up_osds", 0))
+            total = int(stats.get("num_osds", 0))
+            rgw_out, _ = node.exec_command(
+                cmd="ceph orch ps --daemon_type rgw --format json"
+            )
+            rgws = json.loads(rgw_out) if str(rgw_out).strip() else []
+            rgw_ready = bool(rgws) and all(
+                d.get("status_desc") == "running" for d in rgws
+            )
+            osd_ps_out, _ = node.exec_command(
+                cmd="ceph orch ps --daemon_type osd --format json"
+            )
+            osds = json.loads(osd_ps_out) if str(osd_ps_out).strip() else []
+            osd_ready = bool(osds) and all(
+                d.get("status_desc") == "running" for d in osds
+            )
+            status_out, _ = node.exec_command(cmd="ceph status")
+            status = status_out or ""
+            pgs_down = any(
+                token in status
+                for token in ("osds down", "osd down", "peering", "inactive")
+            )
+            last_msg = (
+                f"OSDs {up}/{total} up; orch osd running={osd_ready}; "
+                f"RGW running={rgw_ready}; pgs unavailable={pgs_down}"
+            )
+            log.info(last_msg)
+            if total > 0 and up == total and osd_ready and rgw_ready and not pgs_down:
+                if attempts > 1:
+                    time.sleep(15)
+                log.info("OSDs and RGW recovered after config restart")
+                return
+        except Exception as exc:
+            last_msg = str(exc)
+            log.warning("Waiting for OSD/RGW readiness: %s", exc)
+        time.sleep(interval)
+    raise Exception(
+        f"OSDs/RGW did not recover within {timeout}s after set_config_param: {last_msg}"
+    )
+
+
 def set_config_param(node):
     """
     To set configuration parameters across sites
@@ -611,25 +718,38 @@ def set_config_param(node):
     # restart osd service
     node.exec_command(cmd=f"ceph orch restart {osd_process_name}")
     node.exec_command(cmd="ceph config dump")
+    _wait_for_osd_and_rgw_ready(node)
 
 
 def kernel_mount(mounting_dir, mon_node_ip, kernel_clients):
     try:
+        from utility.odf_defaults import (
+            format_mons_for_kernel_mount,
+            is_msgr1_disabled,
+            kernel_ms_mode_opt,
+        )
+
         for client in kernel_clients:
             out, err = client.exec_command(
                 cmd="sudo ceph auth get-key client.%s" % (client.hostname)
             )
             secret_key = out.rstrip("\n")
             mon_node_ip = mon_node_ip.replace(" ", "")
+            use_msgr2 = is_msgr1_disabled(client)
+            mons = format_mons_for_kernel_mount(mon_node_ip, use_msgr2)
+            ms_opt = kernel_ms_mode_opt(use_msgr2)
             client.exec_command(
-                cmd="sudo mount -t ceph %s:6789:/ %s -o name=%s,secret=%s"
-                % (mon_node_ip, mounting_dir, client.hostname, secret_key)
+                cmd="sudo mount -t ceph %s:/ %s -o name=%s,secret=%s%s"
+                % (mons, mounting_dir, client.hostname, secret_key, ms_opt)
             )
             out, err = client.exec_command(cmd="mount")
             mount_output = out.split()
 
             log.info("Checking if kernel mount is is passed of failed:")
-            if "%s:6789:/" % (mon_node_ip) in mount_output:
+            # Device may be bare IP:port or IP:3300 after msgr2 adjust
+            if any(mounting_dir.rstrip("/") == m for m in mount_output) or any(
+                mons in m for m in mount_output
+            ):
                 log.info("kernel mount passed")
             else:
                 log.error("kernel mount failed")
@@ -1501,6 +1621,11 @@ def generate_self_signed_certificate(subject: Dict) -> Tuple:
                 [
                     x509.DNSName(f"*.{subject['common_name']}"),
                     x509.DNSName(subject["common_name"]),
+                    *[
+                        x509.DNSName(name)
+                        for name in subject.get("extra_dns_names", [])
+                        if name and name != subject["common_name"]
+                    ],
                     x509.IPAddress(ip_address(subject["ip_address"])),
                 ]
             ),
@@ -2073,7 +2198,7 @@ def configure_kafka_cluster_with_security(ceph_cluster, cloud_type):
     redeploy_rgw_service_for_kafka_security(rgw_node1)
 
 
-def config_keystone_ldap(rgw_node, client_node, cloud_type):
+def config_keystone(rgw_node, client_node, cloud_type):
     """Set the keystone config option on the cluster at startup and run deploy_keystone_on_client.sh"""
     cephci_config = get_cephci_config()
     keystone_cfg = cephci_config.get("keystone", {})
@@ -2127,6 +2252,94 @@ def config_keystone_ldap(rgw_node, client_node, cloud_type):
         cmd=f"ceph config set client.{rgw_name} rgw_keystone_url {keystone_server}",
     )
     # Restart rgw service and wait for it to come up
+    restart_rgw_and_wait(rgw_node, rgw_name)
+
+
+def config_ldap(rgw_node, client_node, cloud_type, config=None):
+    """Deploy RHDS on the client node and configure RGW LDAP authentication.
+
+    Mirrors config_keystone(): run deploy_rhds_on_client.sh on the client,
+    point RGW at ldap://<client_ip>:389, then restart RGW.
+    Optional ~/.cephci.yaml keys:
+      ldap.image: container image (e.g. quay.io/389ds/dirsrv:latest)
+    """
+    config = config or {}
+    cephci_config = get_cephci_config()
+    ldap_cfg = cephci_config.get("ldap", {})
+    lookup = cloud_type if cloud_type in ldap_cfg else "openstack"
+    ldap_cloud_cfg = ldap_cfg.get(lookup, ldap_cfg.get("openstack", {}))
+    ldap_image = ldap_cfg.get("image") or ldap_cloud_cfg.get("image")
+    yaml_ldap_url = ldap_cloud_cfg.get("url")
+
+    out = rgw_node.exec_command(sudo=True, cmd="ceph orch ls | grep rgw")
+    rgw_name = out[0].split()[0]
+    client_ip = client_node.ip_address
+    ldap_url = yaml_ldap_url
+
+    clone_configs_repo(client_node, "rgw_configs")
+    ldap_path = "/home/cephuser/configs/rgw/ldap/"
+    ldap_script = os.path.join(ldap_path, "deploy_rhds_on_client.sh")
+    ldap_script_candidates = [
+        ldap_script,
+        "/root/rgw-tests/ceph-qe-scripts/utility/deploy_rhds_on_client.sh",
+        "/home/cephuser/rgw-tests/ceph-qe-scripts/utility/deploy_rhds_on_client.sh",
+        "/root/rhds-src/deploy_rhds_on_client.sh",
+    ]
+    ldap_src = None
+    for candidate in ldap_script_candidates:
+        found, _ = client_node.exec_command(
+            sudo=True,
+            cmd=f"test -f {candidate} && echo found || true",
+            check_ec=False,
+        )
+        if found and "found" in str(found):
+            ldap_src = os.path.dirname(candidate)
+            ldap_script = candidate
+            break
+
+    if ldap_src is None:
+        git_url = config.get(
+            "git-url", "https://github.com/red-hat-storage/ceph-qe-scripts.git"
+        )
+        branch = config.get("branch", "master")
+        dest = "/home/cephuser/rgw-tests"
+        repo_path = f"{dest}/ceph-qe-scripts"
+        log.info(f"Cloning {git_url} ({branch}) onto client for RHDS scripts")
+        client_node.exec_command(sudo=True, cmd=f"mkdir -p {dest}")
+        client_node.exec_command(
+            sudo=True,
+            cmd=f"test -e {repo_path} || git clone {git_url} -b {branch} {repo_path}",
+        )
+        ldap_src = f"{repo_path}/utility"
+        ldap_script = f"{ldap_src}/deploy_rhds_on_client.sh"
+
+    try:
+        client_node.exec_command(sudo=True, cmd="pip install podman-compose")
+        client_node.exec_command(
+            sudo=True, cmd=f"chmod +x {ldap_script} {ldap_src}/init-rhds.sh"
+        )
+        env_prefix = f"LDAP_IMAGE={ldap_image} " if ldap_image else ""
+        client_node.exec_command(
+            sudo=True,
+            cmd=f"{env_prefix}{ldap_script} {ldap_src} {client_ip} --configure-rgw",
+            long_running=True,
+        )
+        log.info("Successfully deployed RHDS on client using deploy_rhds_on_client.sh")
+        ldap_url = f"ldap://{client_ip}:389"
+    except BaseException as be:
+        log.debug(f"Failed to run deploy_rhds_on_client.sh: {be}")
+
+    if not ldap_url:
+        raise ConfigError(
+            f"ldap config missing for cloud_type '{cloud_type}'. "
+            "Add ldap.{cloud}.url to cephci config, or ensure "
+            "deploy_rhds_on_client.sh is available on the client."
+        )
+
+    rgw_node.exec_command(
+        sudo=True,
+        cmd=f"ceph config set client.{rgw_name} rgw_ldap_uri {ldap_url}",
+    )
     restart_rgw_and_wait(rgw_node, rgw_name)
 
 
@@ -2372,6 +2585,7 @@ def run_fio(**fio_args):
         size: 'size' for file size/io size
         cmd_timeout: command timeout in seconds eg., 'notimeout' | 1200
         no_run_time: None | no_runtime
+        extra_args: optional string appended verbatim to the fio command
     Prerequisite: fio package must have been installed on the client node.
     One of device_name, filename, (rbdname,pool) is required.
     """
@@ -2409,6 +2623,10 @@ def run_fio(**fio_args):
         log.info("No runtime provided.")
     elif run_time:
         cmd_args.update({"runtime": run_time, "time_based": True})
+        # fio requires --size with --time_based so it knows the working set;
+        # without it fio writes indefinitely and never honours --runtime.
+        if not cmd_args.get("size"):
+            cmd_args["size"] = "100%"
 
     if fio_args.get("rwmixread"):
         cmd_args.update({"rwmixread": fio_args["rwmixread"]})
@@ -2431,11 +2649,12 @@ def run_fio(**fio_args):
             "numjobs": fio_args.get("num_jobs", "1"),
             "rw": fio_args.get("io_type", "write"),
             "iodepth": fio_args.get("iodepth", "8"),
-            "fsync": fio_args.get("fsync", "32"),
             "group_reporting": True,
             "bs": fio_args.get("bs", "4k"),
         }
     )
+    if fio_args.get("fsync"):
+        cmd_args["fsync"] = fio_args["fsync"]
 
     output_fmt = fio_args.get("output_format")
     if output_fmt:
@@ -2453,6 +2672,10 @@ def run_fio(**fio_args):
         "sudo": True,
         "verbose": fio_args.get("verbose", False),
     }
+    # config_dict_to_string emits "--key value", so pass extra_args when the
+    # command must contain an exact token such as --direct=1.
+    if fio_args.get("extra_args"):
+        exec_args["cmd"] = f"{exec_args['cmd']} {fio_args['extra_args']}"
 
     if fio_args.get("get_time_taken"):
         exec_args["cmd"] = f"time {exec_args['cmd']}"
@@ -2833,18 +3056,80 @@ def log_json_dump(data):
 
 
 def get_registry_info(registry):
-    """Get Registry details from cephci configuration yaml file.
+    """Get registry entry from the host-keyed ``registries`` section.
 
     Args:
-        registry: registry name
+        registry: Registry hostname (e.g. ``cp.icr.io``, ``preprod.icr.io``).
+
+    Returns:
+        dict with at least username/password (``user`` is accepted as an alias
+        for ``username``). Optional keys: ``product``, ``production``.
+
+    Raises:
+        KeyError: when ``registries`` is missing or ``registry`` is not listed.
     """
+    if not registry:
+        raise KeyError("Registry host is required")
     try:
-        __regs = get_cephci_config()["registries"]
-        return __regs[registry]
+        regs = get_cephci_config()["registries"]
+        info = regs[registry]
     except KeyError:
         raise KeyError(
-            "CephCI configuration yaml file does not have 'registries' section"
+            f"CephCI configuration has no registries entry for {registry!r}. "
+            "Add it under the top-level 'registries:' section in ~/.cephci.yaml."
         )
+    if not isinstance(info, dict):
+        raise KeyError(f"Invalid registries entry for {registry!r}")
+    # Normalize user/username from template variants
+    username = info.get("username") or info.get("user")
+    password = info.get("password")
+    if not username or not password:
+        raise KeyError(
+            f"registries[{registry!r}] must include username/user and password"
+        )
+    normalized = dict(info)
+    normalized["username"] = username
+    normalized["password"] = password
+    return normalized
+
+
+def registry_host_from_image(image):
+    """Return registry host from a container image reference."""
+    if not image or not isinstance(image, str):
+        return None
+    host = image.split("/")[0]
+    return host or None
+
+
+def resolve_registry_host(
+    overrides=None, image=None, explicit=None, key="bootstrap-registry"
+):
+    """
+    Resolve which registry host to authenticate against.
+
+    Preference: ``explicit`` > ``overrides[key]`` > image hostname.
+    """
+    if explicit:
+        return explicit
+    overrides = overrides or {}
+    if isinstance(overrides, dict) and overrides.get(key):
+        return overrides[key]
+    return registry_host_from_image(image)
+
+
+def resolve_registry_login(registry_host):
+    """
+    Resolve cephadm/podman login args for a registry host.
+
+    Returns:
+        dict: registry-url, registry-username, registry-password
+    """
+    info = get_registry_info(registry_host)
+    return {
+        "registry-url": registry_host,
+        "registry-username": info["username"],
+        "registry-password": info["password"],
+    }
 
 
 def is_unsecured_registry(test_data):
@@ -2912,9 +3197,20 @@ def restart_rgw_and_wait(rgw_node, rgw_service_name):
 
 
 def setup_gklm_prereq(ceph_cluster, cloud_type):
-    """setup GKLM authentication certs on the rgw nodes, redeploy rgw to mounted gklm certs path
-    and set ceph configs for sse-kms-kmip"""
-    log.info("setting up GKLM prerequisites")
+    """Setup GKLM auth certs on RGW nodes, remount, and set sse-kms-kmip ceph config.
+
+    Legacy path for a *pre-existing* lab GKLM (certs + endpoint files from rgw_configs).
+
+    Preferred for new runs: install GKLM as a podman container from
+    ceph-qe-scripts (``reusables/gklm.py`` / ``test_sse_s3_kms_with_vault.py``),
+    which also remounts ``/usr/local/gklm`` into RGW. Suites should set
+    ``git_clone_configs_repo: true`` so ``IGKLM_5.1_F_CNTR_LNX.tar`` is present,
+    and should *not* need this helper when using on-the-fly container install.
+    """
+    log.info(
+        "setting up GKLM prerequisites (legacy external GKLM); "
+        "prefer ceph-qe-scripts GKLM container install when available"
+    )
     rgw_nodes = ceph_cluster.get_ceph_objects("rgw")
     gklm_auth_cert_path_remote = f"{GKLM_HOME}/rgwselfsigned.cert"
     gklm_auth_key_path_remote = f"{GKLM_HOME}/rgwselfsigned.key"

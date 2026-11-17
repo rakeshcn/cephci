@@ -101,6 +101,23 @@ tests:
                     group: gw_group1
                     enable_auth: false
                     spdk_mem_size: 4096
+          - config:
+              command: shell
+              args:
+                - ceph orch rm nvmeof.rbd.gw_group1
+          - config:
+              command: shell
+              args:              # sleep to get all services deleted
+                - sleep
+                - "60"
+          - config:
+              command: shell
+              args:
+                - ceph config set mon mon_allow_pool_delete true
+          - config:
+              command: shell
+              args:
+                - ceph osd pool rm rbd rbd --yes-i-really-really-mean-it
 
   #  Configure Ceph NVMeoF gateway
   #  Configure Initiators

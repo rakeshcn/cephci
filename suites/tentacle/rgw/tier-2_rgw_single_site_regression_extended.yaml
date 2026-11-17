@@ -155,7 +155,6 @@ tests:
       name: Test user creation with placement and storage class
       desc: Test user creation with placement and storage class
       polarion-id: CEPH-83575880
-      comments: known issue (BZ-2311474) targetted to 9.0
       module: sanity_rgw.py
       config:
         script-name: user_create.py
@@ -204,14 +203,6 @@ tests:
         script-name: ../aws/test_acl.py
         config-file-name: ../../aws/configs/test_public_read_write_acl.yaml
 
-  - test:
-      name: Test Inditex hotfix bz CORS presigned put url
-      desc: CORS ACLs prevents access to buckets with presigned PUT URIs with ACL private header
-      polarion-id: CEPH-83604475
-      module: sanity_rgw.py
-      config:
-        script-name: ../curl/test_cors_using_curl.py
-        config-file-name: ../../curl/configs/test_cors_presigned_put_url_using_curl.yaml
 
   - test:
       name: Greater test coverage for bucket CORS
@@ -327,7 +318,6 @@ tests:
       config:
         script-name: test_bucket_policy_ops.py
         config-file-name: test_public_access_block_restricted_public_buckets.yaml
-      comments: known issue - Bug 2344730 targetted to 9.0
 
   - test:
       name: verify parquet object access after bucket reshard
@@ -416,3 +406,61 @@ tests:
         test-version: v2
         script-name: test_user_bucket_rename.py
         config-file-name: test_object_unlink.yaml
+
+  - test:
+      name: Object Unlink with ZG max shard set to 0
+      desc: RGW Object unlink JIRA IBMCEPH-12702 [BZ#2412473]
+      polarion-id: CEPH-83572908
+      module: sanity_rgw.py
+      config:
+        test-version: v2
+        script-name: test_user_bucket_rename.py
+        config-file-name: test_zg_max_index_shards.yaml
+
+  # Enhanced quota regression coverage
+  - test:
+      name: Test decreasing quota below current usage
+      desc: Test decreasing quota below current usage
+      polarion-id: CEPH-83575572
+      module: sanity_rgw.py
+      config:
+        script-name: test_quota_edge_cases.py
+        config-file-name: test_quota_decrease_below_usage.yaml
+
+  - test:
+      name: Test very large quota values (1PB)
+      desc: Test very large quota values (1PB)
+      polarion-id: CEPH-83575572
+      module: sanity_rgw.py
+      config:
+        script-name: test_quota_edge_cases.py
+        config-file-name: test_quota_edge_large_values.yaml
+
+  - test:
+      name: Test quota set to 1 - minimum boundary test
+      desc: Test quota set to 1 - minimum boundary test
+      polarion-id: CEPH-83575572
+      module: sanity_rgw.py
+      config:
+        script-name: test_quota_edge_cases.py
+        config-file-name: test_quota_edge_one.yaml
+
+  - test:
+      name: Test quota set to 0 - should reject all uploads
+      desc: Test quota set to 0 - should reject all uploads
+      polarion-id: CEPH-83575572
+      module: sanity_rgw.py
+      config:
+        script-name: test_quota_edge_cases.py
+        config-file-name: test_quota_edge_zero.yaml
+
+  - test:
+      name: Test quota recalculation timing after object deletion (eventual consistency)
+      desc: Test quota recalculation timing after object deletion (eventual consistency)
+      polarion-id: CEPH-83575572
+      module: sanity_rgw.py
+      config:
+        script-name: test_quota_edge_cases.py
+        config-file-name: test_quota_timing_after_delete.yaml
+
+

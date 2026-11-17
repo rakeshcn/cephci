@@ -302,63 +302,141 @@ class GenerateServiceSpec:
 
     def generate_osd_spec(self, spec):
         """
-        Return spec content for osd service
+        Return Squid+ OSD service spec YAML.
+
+        Suite YAML may use any accepted input shape (legacy Octopus flat,
+        hybrid top-level ``encrypted``, or already-nested ``spec:``). This
+        method always normalizes DriveGroup options under ``spec:`` and emits
+        the Squid+ supported layout (including optional ``tpm2`` for LUKS2
+        token enrollment).
 
         Args:
-            spec (Dict): osd service spec config
+            spec (Dict): osd service spec config from the suite
 
         Returns:
             service_spec (Str)
 
-        Example::
+        Example suite inputs (all produce nested Squid+ output)::
 
-            spec:
-              - service_type: osd
-                unmanaged: boolean    # true or false
+            # Legacy / Octopus flat — normalized into spec:
+            - service_type: osd
+              service_id: example_osd_spec
+              placement:
+                host_pattern: "*"
+              data_devices:
+                all: true
+              encrypted: true
 
-                placement:
-                  host_pattern: "*"   # either hosts or host_pattern
-                  nodes:
-                    - node2
-                    - node3
+            # Hybrid — top-level encrypted moved under spec:
+            - service_type: osd
+              service_id: osds
+              encrypted: true
+              placement:
+                label: osd
+              spec:
                 data_devices:
-                    all: boolean      # true or false
-                encrypted: boolean    # true or false
+                  all: true
 
-            spec:
-              - service_type: osd
-                unmanaged: boolean    # true or false
-                placement:
-                  host_pattern: "*"   # either hosts or host_pattern
-                  nodes:
-                    - node2
-                    - node3
-                spec:
-                    data_devices:         # all - consider all device/LVs from node
-                        paths: all        # else whatever values provided from config.
-                    encrypted: boolean    # true or false
-                extra_container_args:
-                    - "--cpus=2"
+            # Already Squid+ nested (including crush_device_class / tpm2):
+            - service_type: osd
+              service_id: default_drive_group
+              unmanaged: false
+              placement:
+                host_pattern: "*"
+                nodes:
+                  - node2
+                  - node3
+              spec:
+                crush_device_class: ssd
+                data_devices:         # filters: all, model, vendor, size,
+                  paths: all          # rotational, limit, paths
+                db_devices:
+                  rotational: 0
+                  limit: 2
+                wal_devices:
+                  model: NVME-QQQQ-987
+                journal_devices:
+                  paths: all
+                encrypted: true
+                tpm2: true            # Squid+ LUKS2 TPM2 enrollment
+                filter_logic: AND
+                db_slots: 5
+                wal_slots: 5
+                objectstore: bluestore
+                block_db_size: 12G
+                block_wal_size: 1G
+                osds_per_device: 2
+                method: raw
+              extra_container_args:
+                - "--cpus=2"
+              extra_entrypoint_args:
+                - "--debug"
         """
         template = self._get_template("osd")
         node_names = spec["placement"].pop("nodes", None)
 
         if node_names:
             spec["placement"]["hosts"] = self.get_hostnames(node_names)
-        for item, values in spec["spec"].items():
-            if item in ["data_devices", "db_devices", "wal_devices"]:
-                if values.get("paths"):
-                    if values["paths"] == "all":
-                        devs = []
-                        for host in spec["placement"]["hosts"]:
-                            node = get_node_by_id(self.cluster, host)
-                            devs.extend(
-                                [
-                                    i if isinstance(i, str) else i.path
-                                    for i in node.volume_list
-                                ]
-                            )
-                        spec["spec"][item]["paths"] = [i for i in set(devs)]
+
+        # DriveGroupSpec fields that belong under spec: in Squid+ YAML.
+        # Service-level keys (placement, unmanaged, networks, config,
+        # extra_*_args, …) stay at the document root.
+        drive_group_keys = (
+            "data_devices",
+            "db_devices",
+            "wal_devices",
+            "journal_devices",
+            "data_directories",
+            "encrypted",
+            "tpm2",
+            "crush_device_class",
+            "db_slots",
+            "wal_slots",
+            "objectstore",
+            "osds_per_device",
+            "block_db_size",
+            "block_wal_size",
+            "journal_size",
+            "filter_logic",
+            "preview_only",
+            "data_allocate_fraction",
+            "osd_id_claims",
+            "osd_type",
+            "method",
+        )
+
+        osd_spec = spec.setdefault("spec", {})
+        for key in drive_group_keys:
+            if key not in spec:
+                continue
+            value = spec.pop(key)
+            # Nested spec: wins when the same key is already present.
+            if key not in osd_spec:
+                osd_spec[key] = value
+
+        def _expand_paths_all(device_spec):
+            """Resolve ``paths: all`` to concrete device paths from placement hosts."""
+            if not isinstance(device_spec, dict):
+                return
+            if device_spec.get("paths") != "all":
+                return
+            hosts = spec.get("placement", {}).get("hosts", [])
+            devs = []
+            for host in hosts:
+                node = get_node_by_id(self.cluster, host)
+                devs.extend(
+                    [i if isinstance(i, str) else i.path for i in node.volume_list]
+                )
+            device_spec["paths"] = list(set(devs))
+
+        for item in (
+            "data_devices",
+            "db_devices",
+            "wal_devices",
+            "journal_devices",
+        ):
+            if item in osd_spec:
+                _expand_paths_all(osd_spec[item])
 
         return template.render(spec=spec)
 
@@ -567,7 +645,21 @@ class GenerateServiceSpec:
                   rgw_zone: india
                   rgw_frontend_ssl_certificate: create-cert | <contents of crt>
 
-            contents of rgw_spec.yaml file
+            contents of rgw_spec.yaml file (Tentacle/20.1.0+ with inline certificate_source)
+
+                service_type: rgw
+                service_id: rgw.india
+                placement:
+                  hosts:
+                    - node5
+                spec:
+                  ssl: true
+                  certificate_source: inline
+
+            When certificate_source is inline, ssl_cert and ssl_key are generated
+            and embedded if they are omitted. Explicit PEM values are left unchanged.
+
+            contents of rgw_spec.yaml file (Legacy with rgw_frontend_ssl_certificate)
 
                 service_type: rgw
                 service_id: rgw.india
@@ -587,8 +679,37 @@ class GenerateServiceSpec:
         node_names = spec["placement"].pop("nodes", None)
         if node_names:
             spec["placement"]["hosts"] = self.get_hostnames(node_names)
-
         if spec.get("spec", False):
+            # Tentacle/20.1.0+: cephadm inline requires ssl_cert and ssl_key.
+            # Generate them when the suite only sets certificate_source: inline.
+            if spec["spec"].get("certificate_source") == "inline":
+                ssl_cert_value = spec["spec"].get("ssl_cert")
+                ssl_key_value = spec["spec"].get("ssl_key")
+                needs_cert = ssl_cert_value in (None, "create-cert")
+                needs_key = ssl_key_value in (None, "create-key")
+
+                if needs_cert or needs_key:
+                    subject = {
+                        "common_name": spec["placement"]["hosts"][0],
+                        "ip_address": self.cluster.get_node_by_hostname(
+                            spec["placement"]["hosts"][0]
+                        ).ip_address,
+                    }
+                    key, cert, ca = generate_self_signed_certificate(subject=subject)
+
+                    if needs_cert:
+                        cert_pem = cert + ca
+                        cert_value = "|\n" + cert_pem
+                        spec["spec"]["ssl_cert"] = "\n    ".join(cert_value.split("\n"))
+                        LOG.debug(f"Generated SSL Certificate:\n{cert_pem}")
+
+                    if needs_key:
+                        key_value = "|\n" + key
+                        spec["spec"]["ssl_key"] = "\n    ".join(key_value.split("\n"))
+                        LOG.debug("Generated inline SSL private key")
+
+            # Squid and reef still use rgw_frontend_ssl_certificate, so keep this
+            # path independent of the inline certificate_source handling above.
             if spec["spec"].get("rgw_frontend_ssl_certificate", False):
                 if spec["spec"].get("rgw_frontend_ssl_certificate") == "create-cert":
                     subject = {

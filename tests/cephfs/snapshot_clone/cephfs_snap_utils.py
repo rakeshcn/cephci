@@ -7,6 +7,7 @@ import datetime
 import json
 import random
 import re
+import shlex
 import string
 import time
 
@@ -296,9 +297,11 @@ class SnapUtils(object):
             path : a snap-schedule path which needs to be deactivated
         Optional:
             sched_val : schedule , type - str, a schedule value that needs to be deactivated
+            check_ec : bool, default True
         Returns: None
         for eg., snap_util.deactivate_snap_schedule(client,deactivate_path,sched_val=sched_val)
         """
+        check_ec = kw_args.pop("check_ec", True)
         cmd = f"ceph fs snap-schedule deactivate {path}"
         if kw_args.get("subvol_name"):
             sv_name = kw_args["subvol_name"]
@@ -309,7 +312,7 @@ class SnapUtils(object):
             cmd += f" {kw_args.get('sched_val')}"
         if kw_args.get("fs_name"):
             cmd += f" --fs {kw_args.get('fs_name')}"
-        client.exec_command(sudo=True, cmd=cmd)
+        client.exec_command(sudo=True, cmd=cmd, check_ec=check_ec)
 
     def remove_snap_schedule(self, client, path, **kw_args):
         """
@@ -540,6 +543,29 @@ class SnapUtils(object):
             )
             i += 1
             time.sleep(30)
+
+    def wait_for_scheduled_snaps(
+        self, client, path, min_count=4, timeout=300, interval=15
+    ):
+        """Poll until scheduled snapshots appear under path/.snap/."""
+        snap_dir = f"{path.rstrip('/')}/.snap"
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            out, _ = client.exec_command(
+                sudo=True,
+                cmd=(
+                    f"ls -1 {shlex.quote(snap_dir)}/ | grep -c scheduled " "|| echo 0"
+                ),
+            )
+            snap_count = int(out.strip())
+            log.info("Scheduled snap count under %s: %s", snap_dir, snap_count)
+            if snap_count >= min_count:
+                return
+            time.sleep(interval)
+        raise CommandFailed(
+            f"Scheduled snaps not created under {path} within {timeout}s "
+            f"(expected at least {min_count})"
+        )
 
     def validate_snap_retention(
         self, client, client_path, sched_path, ret_type="m", fs_name="cephfs"

@@ -16,9 +16,21 @@ from ceph.utils import (
 )
 from cephci.utils.build_info import CephTestManifest
 from utility.log import Log
-from utility.utils import get_cephci_config
+from utility.odf_defaults import (
+    APPLY_ODF_DEFAULTS_KEY,
+    apply_odf_defaults_to_bootstrap_config,
+    apply_v2_only_mon_addrs,
+    overrides_enabled,
+)
+from utility.registry_auth import PODMAN_AUTH_PATH
+from utility.utils import (
+    get_rhbuild_major_version,
+    ibm_ceph_rpm_version_pin,
+    resolve_registry_host,
+    resolve_registry_login,
+)
 
-from ..ceph import ResourceNotFoundError
+from ..ceph import CommandFailed, ResourceNotFoundError
 from .common import config_dict_to_string
 from .helper import GenerateServiceSpec, create_ceph_config_file, validate_spec_services
 from .typing_ import CephAdmProtocol
@@ -31,36 +43,19 @@ __DEFAULT_KEYRING_PATH = "/etc/ceph/ceph.client.admin.keyring"
 __DEFAULT_SSH_PATH = "/etc/ceph/ceph.pub"
 
 
-def _detect_registry_tier(registry: str, build_type: str) -> str:
-    """Return credential tier (cdn/stage) from registry host, else from build_type."""
-    if not registry:
-        return "cdn" if build_type in ("released", "cdn") else "stage"
-    if "registry.redhat.io" in registry or "cp.icr.io" in registry:
-        return "cdn"
-    if "stage" in registry or "stg" in registry or "quay" in registry:
-        return "stage"
-    return "cdn" if build_type in ("released", "cdn") else "stage"
-
-
 def construct_registry(
     cls,
     registry: str,
     json_file: bool = False,
-    product: str = "redhat",
-    build_type: str = "released",
 ):
     """
-    Construct registry credentials for bootstrapping cluster
+    Construct registry credentials for bootstrapping cluster from host-keyed
+    ``registries:`` entries in ~/.cephci.yaml.
 
     Args:
         cls (CephAdmin): class object
-        registry (Str): registry name
+        registry (Str): registry hostname (e.g. preprod.icr.io)
         json_file (Bool): registry credentials in JSON file (default:False)
-        product: ceph product - ibm/redhat
-        build_type: CLI build type (released|cdn|stage|nightly etc.)
-
-    Registry tier is chosen from the registry hostname when it matches a known
-    RH/IBM host; otherwise build_type is used (released/cdn -> cdn, else stage).
 
     Example::
 
@@ -72,35 +67,13 @@ def construct_registry(
     Returns:
         constructed string of registry credentials ( Str )
     """
-    _vendor = "ibm" if "ibm" in product else "rh"
-
-    _config = get_cephci_config()
-    _reg = registry if registry else ""
-    _tier = _detect_registry_tier(_reg, build_type)
-    logger.debug(
-        "Registry tier selection: registry=%r tier=%r build_type=%r vendor=%r",
-        _reg,
-        _tier,
-        build_type,
-        _vendor,
-    )
-
-    # Prefer the nested credentials.registry.<vendor>.<tier> path which
-    # carries separate entries for cdn (cp.icr.io) vs stage (cp.stg.icr.io).
-    cdn_cred = (
-        _config.get("credentials", {}).get("registry", {}).get(_vendor, {}).get(_tier)
-    )
-
-    if not cdn_cred:
-        # Fall back to the flat top-level key (legacy config layout)
-        cdn_cred = _config.get(
-            f"{_vendor}_registry_credentials", _config["cdn_credentials"]
+    if not registry:
+        raise ValueError(
+            "Registry host is required for construct_registry. Pass "
+            "--custom-config bootstrap-registry=<host> or use an image with a host."
         )
-    reg_args = {
-        "registry-url": cdn_cred.get("registry", registry),
-        "registry-username": cdn_cred.get("username"),
-        "registry-password": cdn_cred.get("password"),
-    }
+    reg_args = resolve_registry_login(registry)
+    logger.debug("Registry login args for host %r", registry)
     if json_file:
         reg = dict((k.lstrip("registry-"), v) for k, v in reg_args.items())
 
@@ -260,6 +233,26 @@ class BootstrapMixin:
         _ceph_version = args.pop("rhcs-version", None)
         _manifest_section = args.pop("release", None)
         _target_platform = args.pop("platform", self.config["platform"])
+
+        # If release section is requested but rhcs-version is not hardcoded in
+        # the suite YAML, derive the version dynamically from the job release
+        # (self.config["release"] is set by run.py from --rhbuild).
+        # This allows upgrade suites to automatically pick up the same-version
+        # stable baseline (e.g. 9.2 stable when running against a 9.2 job release)
+        # without any hardcoding in the suite YAML.
+        if not _ceph_version and _manifest_section:
+            _ceph_version = self.config.get("release")
+            if not _ceph_version:
+                raise ValueError(
+                    "release section is set in suite YAML but config['release'] is "
+                    "unset — cannot derive baseline version automatically. "
+                    "Pass rhcs-version explicitly in the suite YAML."
+                )
+            logger.info(
+                f"rhcs-version not set in suite; deriving baseline version "
+                f"{_ceph_version!r} from job release for '{_manifest_section}' section."
+            )
+
         if _ceph_version and _manifest_section:
             manifest_obj = CephTestManifest(
                 product=self.config["product"],
@@ -267,6 +260,27 @@ class BootstrapMixin:
                 build_type=_manifest_section,
                 platform=_target_platform,
             )
+
+            # Guard against invalid downgrade paths.
+            # The baseline version (from the manifest section e.g. stable/respin)
+            # must be <= the target build version being tested. If the baseline is
+            # higher, the upgrade would actually be a downgrade — an unsupported
+            # Ceph scenario that produces misleading failures and wastes CI resources.
+            # Example of invalid path: baseline 19.2.1-416 (stable) -> target 19.2.1-405 (respin)
+            _baseline_ver = manifest_obj.ceph_version
+            _target_ver = self.config["manifest"].ceph_version
+            if LooseVersion(_baseline_ver) > LooseVersion(_target_ver):
+                raise RuntimeError(
+                    f"Invalid upgrade path detected — aborting. "
+                    f"Baseline '{_manifest_section}' build ({_baseline_ver}) is higher "
+                    f"than the target build ({_target_ver}). "
+                    f"This is a downgrade, which is not a supported Ceph upgrade "
+                    f"scenario. Skipping upgrade suite to avoid misleading failures."
+                )
+            logger.info(
+                f"Upgrade path validated: baseline {_baseline_ver} -> target {_target_ver}."
+            )
+
             self.config["base_url"] = manifest_obj.repository
             self.config["container_image"] = manifest_obj.ceph_image
             rhbuild = f"{manifest_obj.ceph_version}-{manifest_obj.platform}"
@@ -313,8 +327,8 @@ class BootstrapMixin:
             if build_type == "upstream" or manifest_obj.product == "community":
                 _rpm_version = f"{_ceph_version}*"
             else:
-                # * is to enable any test hotfix provided
-                _rpm_version = f"2:{_ceph_version}.el{_os_major}cp"
+                # IBM Storage Ceph: 2:VR.elNcp (epoch + cp retained for 21.x)
+                _rpm_version = ibm_ceph_rpm_version_pin(_ceph_version, _os_major)
 
             self.install(**{"rpm_version": _rpm_version})
 
@@ -331,36 +345,50 @@ class BootstrapMixin:
         cmd += " bootstrap"
 
         # Construct registry credentials as string or json.
-        registry_url = args.pop("registry-url", None)
+        # Prefer --custom-config bootstrap-registry=<host>; else image host.
+        # Suite registry-json only selects JSON credential form (not the login host).
+        # Suites often hardcode registry-json: registry.redhat.io; using that as the
+        # login host would break IBM pulls (e.g. preprod.icr.io image + RH auth).
+        #
+        # When podman-auth-file is set (--custom-config), skip YAML registry flags so
+        # cephadm uses /etc/ceph/podman-auth.json (ODF / multi-registry auth file path).
+        args.pop("registry-url", None)
         registry_json = args.pop("registry-json", None)
+        use_podman_auth = self.config.get("podman_auth_file")
 
-        # Auto-detect registry from custom_image or container image and add credentials if needed
-        if custom_image and isinstance(custom_image, str):
-            image_registry = custom_image.split("/")[0]
+        if use_podman_auth:
+            logger.info(
+                "podman-auth-file is configured, skipping registry credentials "
+                "(cephadm will use %s)",
+                PODMAN_AUTH_PATH,
+            )
         else:
-            image_registry = self.config["container_image"].split("/")[0]
+            if custom_image and isinstance(custom_image, str):
+                image_ref = custom_image
+            else:
+                image_ref = self.config.get("container_image")
 
-        registry_url = image_registry
-        logger.info(
-            f"Auto-detected registry {registry_url} from container image, adding credentials"
-        )
-
-        if registry_url or manifest_obj.product == "ibm":
-            cmd += construct_registry(
-                self,
+            overrides = self.config.get("overrides") or {}
+            registry_url = resolve_registry_host(
+                overrides=overrides,
+                image=image_ref,
+                key="bootstrap-registry",
+            )
+            logger.info(
+                "Using registry host %r for bootstrap login "
+                "(bootstrap-registry / image host)",
                 registry_url,
-                product=manifest_obj.product,
-                build_type=build_type,
             )
 
-        if registry_json:
-            cmd += construct_registry(
-                self,
-                registry_json,
-                json_file=True,
-                product=manifest_obj.product,
-                build_type=build_type,
-            )
+            if not registry_url:
+                logger.warning(
+                    "No registry host resolved; "
+                    "skipping registry credentials on bootstrap"
+                )
+            elif registry_json is not None:
+                cmd += construct_registry(self, registry_url, json_file=True)
+            else:
+                cmd += construct_registry(self, registry_url)
 
         # Generate dashboard certificate and key if bootstrap cli
         # have this options as dashboard-key and dashboard-crt
@@ -396,6 +424,12 @@ class BootstrapMixin:
             args["apply-spec"] = GenerateServiceSpec(
                 node=self.installer, cluster=self.cluster, specs=specs
             ).create_spec_file()
+
+        # Opt-in ODF/Rook-like defaults via --custom-config apply-odf-defaults=true
+        # Merges into args.config before INI render so mon_osd_*_ratio seeds OSDMap.
+        apply_odf_defaults_to_bootstrap_config(
+            args, overrides=self.config.get("overrides")
+        )
 
         # Bootstrap with ceph config options like ceph.conf file
         conf = args.get("config")
@@ -500,7 +534,9 @@ class BootstrapMixin:
             # - 7.1z3: https://bugzilla.redhat.com/show_bug.cgi?id=2314606
             # - 8.0: https://bugzilla.redhat.com/show_bug.cgi?id=2314438
             # - https://access.redhat.com/solutions/7088483
-            config_level = "global" if rhbuild.split(".")[0] >= "6" else "mon"
+            config_level = (
+                "global" if get_rhbuild_major_version(rhbuild) >= 6 else "mon"
+            )
             self.shell(
                 args=[
                     "ceph",
@@ -520,5 +556,18 @@ class BootstrapMixin:
             validate_spec_services(
                 self.installer, specs=specs, rhcs_version=self.cluster.rhcs_version
             )
+
+        # ODF-style v2-only monmap (requires live mon after bootstrap)
+        overrides = (self.config or {}).get("overrides") or {}
+        if overrides_enabled(overrides, APPLY_ODF_DEFAULTS_KEY):
+            logger.info(
+                "Applying v2-only mon addrs after bootstrap "
+                "(--custom-config apply-odf-defaults=true)"
+            )
+            failures = apply_v2_only_mon_addrs(self.shell)
+            if failures:
+                raise CommandFailed(
+                    "v2-only mon set-addrs failed: " + "; ".join(failures)
+                )
 
         return out, err

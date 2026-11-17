@@ -7,6 +7,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+from ceph.ceph import CommandFailed
 from ceph.ceph_admin.daemon import Daemon
 from ceph.ceph_admin.host import Host
 from ceph.ceph_admin.orch import Orch
@@ -68,6 +69,20 @@ class HighAvailability:
             "maintanence_mode": self.maintanence_mode,
         }
 
+    def set_gateway_locations(self, gw_location_map):
+        """Set location on each gateway via ``ceph nvme-gw set-location``."""
+        from cli.ceph.nvme_gw import NvmeGw
+
+        if not self.nvme_service:
+            raise RuntimeError("nvme_service is required to set gateway locations")
+        nvme_gw = NvmeGw(self.orch.installer, "ceph")
+        pool = self.nvme_service.nvme_metadata_pool
+        group = self.nvme_service.group
+        for gw_id, loc in (gw_location_map or {}).items():
+            LOG.info("Setting gateway location %s -> %s", gw_id, loc)
+            nvme_gw.set_location(gw_id, pool, group, loc)
+        return True
+
     def system_control(self, gateway, action, wait_for_active_state=True):
         """SystemCtl methods to control nvme unit service states.
 
@@ -90,9 +105,48 @@ class HighAvailability:
             "is-active": gateway.systemctl.is_active,
         }
 
-        unit_service = gateway.system_unit_id
-        op = ops[action]
-        op(unit_service)
+        last = None
+        unit_service = None
+        for attempt in range(1, 4):
+            node = getattr(gateway, "node", None)
+            if node is not None:
+                for conn in (
+                    getattr(node, "root_connection", None),
+                    getattr(node, "connection", None),
+                ):
+                    if conn is None:
+                        continue
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                try:
+                    node.reconnect()
+                except Exception as extra:
+                    LOG.warning(
+                        "Reconnect %s before systemctl %s (attempt %s): %s",
+                        gateway.hostname,
+                        action,
+                        attempt,
+                        extra,
+                    )
+            try:
+                unit_service = gateway.system_unit_id
+                ops[action](unit_service)
+                last = None
+                break
+            except (CommandFailed, EOFError, OSError) as extra:
+                last = extra
+                LOG.warning(
+                    "systemctl %s %s attempt %s failed: %s",
+                    action,
+                    gateway.hostname,
+                    attempt,
+                    extra,
+                )
+                time.sleep(5)
+        if last:
+            raise last
 
         if wait_for_active_state is None:
             return
@@ -718,10 +772,20 @@ class HighAvailability:
                             )
                             validate_initiator(self.clients, active_gw_obj, ns_list, gw)
 
-                        # Wait for IO to complete and collect FIO outputs
+                        # Stop FIO and collect outputs.
+                        # cancel_futures=True only prevents queued futures from
+                        # starting; it does NOT interrupt threads already running
+                        # fio to 100%.  Kill the remote fio process on every
+                        # initiator node first so the blocked threads unblock
+                        # quickly, then shut down the pool.
                         fio_outputs = []
                         if io_tasks:
-                            LOG.info("Waiting for completion of IOs.")
+                            LOG.info(
+                                "Stopping IO on all initiator nodes before executor shutdown."
+                            )
+                            for initiator in self.clients:
+                                initiator.stop_fio()
+                            LOG.info("Shutting down IO executor.")
                             executor.shutdown(wait=True, cancel_futures=True)
 
                             for task in io_tasks:
@@ -788,10 +852,15 @@ class HighAvailability:
 
                             LOG.info("Validating IO after failback")
                             validate_io(self.orch, namespaces_for_io)
-                            # Wait for IO to complete and collect FIO outputs
+                            # Stop FIO and collect outputs (same pattern as failover).
                             fio_outputs = []
                             if io_tasks:
-                                LOG.info("Waiting for completion of IOs.")
+                                LOG.info(
+                                    "Stopping IO on all initiator nodes before executor shutdown."
+                                )
+                                for initiator in self.clients:
+                                    initiator.stop_fio()
+                                LOG.info("Shutting down IO executor.")
                                 executor.shutdown(wait=True, cancel_futures=True)
 
                                 for task in io_tasks:

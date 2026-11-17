@@ -3,7 +3,7 @@ import json
 import re
 import tempfile
 
-from ceph.rbd.utils import exec_cmd, random_string
+from ceph.rbd.utils import exec_cmd, get_ceph_version_from_rhbuild, random_string
 from ceph.rbd.workflows.rbd import create_single_pool_and_images
 from cli.rbd.rbd import Rbd
 from utility.log import Log
@@ -109,7 +109,7 @@ def run_prepare_execute_commit(rbd, pool, image, **kw):
         client=kw["client"],
         cluster="ceph",
         rbd=rbd,
-        ceph_version=int(config.get("rhbuild")[0]),
+        ceph_version=get_ceph_version_from_rhbuild(config.get("rhbuild")),
         is_ec_pool=is_ec_pool,
         is_secondary=False,
         do_not_create_image=True,
@@ -358,12 +358,15 @@ def prepare_native_source_spec_with_key(
     return write_native_source_spec(client, spec_path, spec)
 
 
-def attempt_migration_prepare_import(client, source_spec_path, dest_spec, timeout=300):
+def attempt_migration_prepare_import(client, source_spec_path, dest_spec, timeout=420):
     """Run ``rbd migration prepare --import-only`` and capture pass/fail + output.
 
     Uses ``check_ec=False`` so negative cases can assert on failure without
-    raising. Default *timeout* is shorter than a long-running migration so
-    unreachable-mon cases fail within a bounded window.
+    raising. Default *timeout* is set to 420 seconds (7 minutes) — longer than
+    Ceph's internal connection timeout of ~300 seconds — so that an invalid or
+    unreachable mon_host is allowed to time out on the Ceph side itself and
+    return the expected ``(110) Connection timed out`` error naturally, without
+    the external wrapper killing the command first.
 
     Args:
         client: Destination CephNode client.

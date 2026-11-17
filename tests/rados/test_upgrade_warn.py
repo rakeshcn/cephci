@@ -14,6 +14,11 @@ import json
 import time
 
 from looseversion import LooseVersion
+from upgrade_thrashing.upgrade_cephx_rotation import (
+    cephx_remediation_enabled,
+    run_cephx_post_upgrade_steps,
+    snapshot_cephx_keys,
+)
 
 from ceph.ceph import CommandFailed
 from ceph.ceph_admin import CephAdmin
@@ -24,8 +29,36 @@ from ceph.utils import get_node_by_id, mgr_accept_license, remove_repos
 from cephci.utils.build_info import CephTestManifest
 from tests.rados.monitor_configurations import MonConfigMethods
 from utility.log import Log
+from utility.utils import resolve_registry_host, resolve_registry_login
 
 log = Log(__name__)
+
+
+def _login_upgrade_registry(orch, ceph_cluster, config):
+    """
+    Authenticate against the upgrade target registry before pull/upgrade-check.
+
+    Prefer --custom-config upgrade-registry=<host>; else the container image host.
+    Credentials come from the host-keyed ``registries:`` section in ~/.cephci.yaml.
+    """
+    overrides = config.get("overrides") or {}
+    registry_host = resolve_registry_host(
+        overrides=overrides,
+        image=config.get("container_image"),
+        key="upgrade-registry",
+    )
+    if not registry_host:
+        log.warning("No upgrade registry host resolved; skipping registry login")
+        return
+
+    reg_args = resolve_registry_login(registry_host)
+    log.info(
+        "Logging into upgrade registry %s (image=%s)",
+        registry_host,
+        config.get("container_image"),
+    )
+    for node in ceph_cluster.get_nodes(ignore="client"):
+        orch.registry_login(node=node, args=reg_args)
 
 
 def run(ceph_cluster, **kw):
@@ -67,6 +100,7 @@ def run(ceph_cluster, **kw):
     """
     log.info(run.__doc__)
     config = kw["config"]
+    config["overrides"] = kw.get("test_data", {}).get("custom_config_dict")
     args = config.get("args", {})
     timeout = config.get("timeout", 3600)
     rhbuild = config.get("rhbuild")
@@ -98,6 +132,11 @@ def run(ceph_cluster, **kw):
         f"ceph versions: {rados_obj.run_ceph_command(cmd='ceph versions')} \n"
     )
     log.info(log_dump)
+
+    pre_cephx_keys = None
+    if cephx_remediation_enabled(config):
+        pre_cephx_keys = snapshot_cephx_keys(rados_obj)
+
     if enable_debug_level:
         log.debug("Setting up debug configs on the cluster for mon & Mgr daemons")
         mon_obj.set_config(section="mon", name="debug_mon", value="30/30")
@@ -188,6 +227,9 @@ def run(ceph_cluster, **kw):
         upgd_dict = {"upgrade": True, "rpm_version": _rpm_version}
         cluster_obj.install(**upgd_dict)
         time.sleep(5)
+
+        # Authenticate against upgrade image registry (host-keyed registries:)
+        _login_upgrade_registry(cluster_obj, ceph_cluster, config)
 
         # Check service versions vs available and target containers
         cluster_obj.upgrade_check(image=config.get("container_image"))
@@ -367,6 +409,21 @@ def run(ceph_cluster, **kw):
             f"ceph versions: {rados_obj.run_ceph_command(cmd='ceph versions')} \n"
         )
         log.info(log_dump)
+
+        if cephx_remediation_enabled(config):
+            log.info("CephX post-upgrade key verify + remediation")
+            cephx_out = run_cephx_post_upgrade_steps(
+                cephadm_obj,
+                rados_obj,
+                ceph_cluster,
+                config=config,
+                pre_snapshot=pre_cephx_keys,
+            )
+            if not cephx_out.get("ok"):
+                raise Exception(
+                    "CephX post-upgrade failed: "
+                    + "; ".join(cephx_out.get("errors") or [])
+                )
 
         if verify_warning:
             """

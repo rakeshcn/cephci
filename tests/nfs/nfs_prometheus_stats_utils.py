@@ -261,10 +261,15 @@ MANIFEST_METRIC_ALIASES = {
     "nfs_requests_total": (
         "nfs_requests_total",
         "requests_total",
+        # Product often exposes RPC ingress instead of a global requests_total
+        "rpcs_received_total",
+        "nfs_rpcs_received_total",
     ),
     "requests_total": (
         "nfs_requests_total",
         "requests_total",
+        "rpcs_received_total",
+        "nfs_rpcs_received_total",
     ),
     "client_requests_total": (
         "client_requests_total",
@@ -322,11 +327,72 @@ MANIFEST_METRIC_ALIASES = {
         "mdcache_cache_hits_total",
         "mdcache_cache_hits_by_export_total",
         "nfs_mdcache_hits_total",
+        "mdcache_hits_total",
     ),
     "mdcache_cache_misses_total": (
         "mdcache_cache_misses_total",
         "mdcache_cache_misses_by_export_total",
         "nfs_mdcache_misses_total",
+        "mdcache_misses_total",
+    ),
+    "nfs_mdcache_misses_total": (
+        "nfs_mdcache_misses_total",
+        "mdcache_cache_misses_total",
+        "mdcache_misses_total",
+    ),
+    "nfs_mdcache_hits_total": (
+        "nfs_mdcache_hits_total",
+        "mdcache_cache_hits_total",
+        "mdcache_hits_total",
+    ),
+    # New metrics / LEGACY_METRICS=OFF nomenclature (TC-PROM-NEW / NOM)
+    "ganesha_uptime_seconds": (
+        "ganesha_uptime_seconds",
+        "nfs_ganesha_uptime_seconds",
+    ),
+    "nfs_ganesha_uptime_seconds": (
+        "nfs_ganesha_uptime_seconds",
+        "ganesha_uptime_seconds",
+    ),
+    "export_total_size": (
+        "export_total_size",
+        "nfs_export_total_size",
+    ),
+    "nfs_export_total_size": (
+        "nfs_export_total_size",
+        "export_total_size",
+    ),
+    "export_available_size": (
+        "export_available_size",
+        "nfs_export_available_size",
+    ),
+    "nfs_export_available_size": (
+        "nfs_export_available_size",
+        "export_available_size",
+    ),
+    "export_available_file_count": (
+        "export_available_file_count",
+        "nfs_export_available_file_count",
+    ),
+    "nfs_export_available_file_count": (
+        "nfs_export_available_file_count",
+        "export_available_file_count",
+    ),
+    "export_free_bytes_percent": (
+        "export_free_bytes_percent",
+        "nfs_export_free_bytes_percent",
+    ),
+    "nfs_export_free_bytes_percent": (
+        "nfs_export_free_bytes_percent",
+        "export_free_bytes_percent",
+    ),
+    "export_inode_utilization": (
+        "export_inode_utilization",
+        "nfs_export_inode_utilization",
+    ),
+    "nfs_export_inode_utilization": (
+        "nfs_export_inode_utilization",
+        "export_inode_utilization",
     ),
     "nfs_requests_by_export_total": (
         "nfs_requests_by_export_total",
@@ -458,6 +524,12 @@ def get_installer(ceph_cluster):
 
 
 def _install_ceph_common_if_needed(node):
+    """Install ceph-common when the node has no ``ceph`` CLI.
+
+    ``exec_command(..., check_ec=False)`` returns ``(stdout, stderr)``, not
+    an exit code. dnf/yum write progress to stderr, so treating the second
+    tuple item as ``rc`` fails a successful install.
+    """
     out, _ = node.exec_command(
         sudo=True,
         cmd="command -v ceph && echo present || echo absent",
@@ -469,12 +541,19 @@ def _install_ceph_common_if_needed(node):
         "dnf install -y ceph-common --nogpgcheck",
         "yum install -y ceph-common --nogpgcheck",
     ):
-        _, rc = node.exec_command(
+        _, err = node.exec_command(
             sudo=True, cmd=install_cmd, check_ec=False, timeout=600
         )
-        if rc == 0:
+        if int(getattr(node, "exit_status", 1)) == 0:
             log.info("Installed ceph-common on %s", node.hostname)
             return
+        log.warning(
+            "ceph-common install via '%s' failed on %s (rc=%s): %s",
+            install_cmd,
+            node.hostname,
+            getattr(node, "exit_status", None),
+            (err or "").strip()[:500],
+        )
     raise OperationFailedError("Failed to install ceph-common on %s" % node.hostname)
 
 
@@ -2542,6 +2621,7 @@ def firewall_allow_port(node, port):
         node.exec_command(
             sudo=True,
             cmd=f"firewall-cmd --add-port={port}/tcp",
+            timeout=120,
         )
     except CommandFailed as err:
         raise OperationFailedError(
@@ -2550,24 +2630,91 @@ def firewall_allow_port(node, port):
     log.info("Opened runtime firewall port %s/tcp on %s", port, node.hostname)
 
 
+def firewall_allow_port_permanent(node, port):
+    """Open port in the public zone, reload, and log the active rules.
+
+    Used immediately before the F-02B metrics curl. On #151 a runtime-only
+    open of the port under test (9588) was already in place and the scrape
+    still failed. A public-zone permanent rule plus reload made the same
+    curl succeed on executor #3458.
+    """
+    if not _firewalld_is_running(node):
+        log.info(
+            "firewalld not running on %s; port %s assumed reachable",
+            node.hostname,
+            port,
+        )
+        return
+    try:
+        node.exec_command(
+            sudo=True,
+            cmd="firewall-cmd --zone=public --add-port=%s/tcp --permanent" % port,
+            timeout=120,
+        )
+        node.exec_command(sudo=True, cmd="firewall-cmd --reload", timeout=120)
+        out, _ = node.exec_command(
+            sudo=True, cmd="firewall-cmd --list-all", timeout=120
+        )
+    except CommandFailed as err:
+        raise OperationFailedError(
+            "Failed to open permanent firewall port %s/tcp on %s: %s"
+            % (port, node.hostname, err)
+        ) from err
+    log.info(
+        "Opened permanent public-zone port %s/tcp on %s before metrics scrape\n%s",
+        port,
+        node.hostname,
+        (out or "").strip(),
+    )
+
+
 def firewall_remove_port(node, port):
-    """Remove a runtime firewalld TCP port opened by firewall_allow_port()."""
+    """Remove a public-zone metrics port from runtime and permanent config.
+
+    Runtime removal uses the public zone, matching the permanent add. The
+    permanent rule is dropped and firewalld is reloaded so a later reload
+    cannot bring the port back when the default zone is not public.
+    """
     if not _firewalld_is_running(node):
         return
     try:
         node.exec_command(
             sudo=True,
-            cmd=f"firewall-cmd --remove-port={port}/tcp",
+            cmd="firewall-cmd --zone=public --remove-port=%s/tcp" % port,
+            timeout=120,
         )
     except CommandFailed as err:
         log.warning(
-            "Failed to remove firewall port %s/tcp on %s: %s",
+            "Failed to remove runtime public-zone port %s/tcp on %s: %s",
+            port,
+            node.hostname,
+            err,
+        )
+    try:
+        node.exec_command(
+            sudo=True,
+            cmd="firewall-cmd --zone=public --remove-port=%s/tcp --permanent" % port,
+            timeout=120,
+        )
+    except CommandFailed as err:
+        log.info(
+            "No permanent public-zone port %s/tcp to remove on %s: %s",
             port,
             node.hostname,
             err,
         )
         return
-    log.info("Removed runtime firewall port %s/tcp on %s", port, node.hostname)
+    try:
+        node.exec_command(sudo=True, cmd="firewall-cmd --reload", timeout=120)
+    except CommandFailed as err:
+        log.warning(
+            "Removed permanent port %s/tcp on %s but firewall reload failed: %s",
+            port,
+            node.hostname,
+            err,
+        )
+        return
+    log.info("Removed firewall port %s/tcp on %s", port, node.hostname)
 
 
 def run_ganesha_stats(nfs_node, container_id, *args):
@@ -2708,6 +2855,7 @@ def verify_f02_enable_metrics_reload_vs_restart(ctx):
     )
     ctx.refresh_container_id()
     verify_monitoring_port_listening(ctx.nfs_node, port)
+    firewall_allow_port_permanent(ctx.nfs_node, port)
     if not metrics_scrape_ok(ctx.client, ctx.nfs_ip, port):
         raise OperationFailedError(
             "F-02B: metrics not restored after redeploy with enable_metrics=true"

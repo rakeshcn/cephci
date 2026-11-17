@@ -61,7 +61,8 @@ from ceph.ceph_admin.helper import check_service_exists
 from utility import utils
 from utility.log import Log
 from utility.utils import (
-    config_keystone_ldap,
+    config_keystone,
+    config_ldap,
     configure_kafka_security,
     get_cephci_config,
     install_start_kafka,
@@ -213,7 +214,8 @@ def run(ceph_cluster, **kw):
     git_clone_configs_repo = config.get("git_clone_configs_repo", False)
     install_start_kafka_broker = config.get("install_start_kafka")
     configure_kafka_broker_security = config.get("configure_kafka_security")
-    install_keystone_ldap = config.get("install_keystone_ldap")
+    install_keystone = config.get("install_keystone")
+    install_ldap = config.get("install_ldap")
     cloud_type = config.get("cloud-type")
     log.info(f"Cloud Type is {cloud_type}")
     test_config = {"config": config.get("test-config", {})}
@@ -299,6 +301,9 @@ def run(ceph_cluster, **kw):
     if configure_kafka_broker_security:
         configure_kafka_security(ceph_cluster, cloud_type)
 
+    # Legacy: wire a pre-existing lab GKLM (static certs/endpoint from rgw_configs).
+    # New GKLM SSE-KMS suites install GKLM in-container via ceph-qe-scripts
+    # (reusables/gklm.py) and only need git_clone_configs_repo for the image tar.
     setup_gklm_prerequisites = config.get("setup_gklm_prerequisites")
     if setup_gklm_prerequisites:
         setup_gklm_prereq(ceph_cluster, cloud_type)
@@ -311,8 +316,10 @@ def run(ceph_cluster, **kw):
         if not rgw_status:
             raise Exception("rgw service restart failed")
 
-    if install_keystone_ldap:
-        config_keystone_ldap(rgw_node, client_node, cloud_type)
+    if install_keystone:
+        config_keystone(rgw_node, client_node, cloud_type)
+    if install_ldap:
+        config_ldap(rgw_node, client_node, cloud_type, config=config)
 
     out, err = exec_from.exec_command(cmd="ls -l venv", check_ec=False)
     if not out:

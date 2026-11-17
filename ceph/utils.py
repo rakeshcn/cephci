@@ -23,6 +23,7 @@ from compute.baremetal import CephBaremetalNode
 from compute.ibm_vpc import CephVMNodeIBM, get_ibm_service
 from compute.onecloud import (
     CephVMNodeOneCloud,
+    extra_disks_for_onecloud_vm,
     generate_onecloud_node_name,
     get_onecloud_client,
     get_vlan_for_site,
@@ -32,6 +33,7 @@ from compute.onecloud import (
     process_onecloud_custom_config,
     resolve_image_for_site,
     resolve_project_for_site,
+    verify_onecloud_extra_disks,
 )
 from compute.openshift import (
     CephVMNodeOCP,
@@ -547,15 +549,20 @@ def create_onecloud_ceph_nodes(
 
         node_dict = ceph_cluster.get(node_key)
         role = RolesContainer(node_dict.get("role") or ["pool"])
-        # OneCloud API: VM names must be 1-25 chars, alphanumeric + hyphens only
-        node_name = generate_onecloud_node_name(run_id, node_key, role)
-        virtual_machines.append(
-            {
-                "vmname": node_name,
-                "vmnotes": f"CephCI node {node_key}",
-            }
+        # OneCloud API: VM names must be 1-25 chars, alphanumeric + hyphens only.
+        # Pass CLI instances_name only (not login/cephci default used for cluster name).
+        node_name = generate_onecloud_node_name(
+            run_id, node_key, role, instances_name=instances_name
         )
-        # OneCloud does not support custom disk provisioning; ignore no-of-volumes/disk-size
+        vm_spec = {
+            "vmname": node_name,
+            "vmnotes": f"CephCI node {node_key}",
+        }
+        extra_disks = extra_disks_for_onecloud_vm(role, node_dict)
+        extra_disk_sizes = [int(d["size_gb"]) for d in extra_disks]
+        if extra_disks:
+            vm_spec["disks"] = extra_disks
+        virtual_machines.append(vm_spec)
         node_specs[node_name] = {
             "node_key": node_key,
             "node_dict": node_dict,
@@ -563,8 +570,7 @@ def create_onecloud_ceph_nodes(
             "id": node_dict.get("id") or node_key,
             "location": node_dict.get("location"),
             "root_login": node_dict.get("root-login", True),
-            "no_of_volumes": 0,
-            "disk_size": 0,
+            "extra_disk_sizes": extra_disk_sizes,
         }
 
     if not virtual_machines:
@@ -733,6 +739,12 @@ def create_onecloud_ceph_nodes(
             log.warning("OneCloud: VM %s not found in cluster response", vmname)
             continue
 
+        vm_data = verify_onecloud_extra_disks(
+            vmname,
+            vm_data,
+            spec["extra_disk_sizes"],
+            client=client,
+        )
         vm = CephVMNodeOneCloud(
             node=vm_data,
             api_key=api_key,
@@ -1119,18 +1131,39 @@ def create_ocpvirt_ceph_nodes(
         ocp_creds: Auth-only credential file with globals["ocpvirt-credentials"].
         run_id: Unique id for the run.
         instances_name: Optional name prefix for instances.
-        custom_config: CLI overrides (ocpvirt_namespace, ocpvirt_profile, batch sizes).
+        custom_config: CLI overrides (ocpvirt_namespace, ocpvirt_profile /
+            ocpvirt_cpu+ocpvirt_memory, batch sizes).
     """
     batch_cfg = process_ocpvirt_custom_config(custom_config)
     pvc_batch_size = batch_cfg["pvc_batch_size"]
     vm_batch_size = batch_cfg["vm_batch_size"]
     profile = batch_cfg.get("ocpvirt_profile")
-    log.info(
-        "Creating OCP Virtualization instances "
-        f"(pvc_batch_size={pvc_batch_size}, vm_batch_size={vm_batch_size}"
-        + (f", profile={profile}" if profile else "")
-        + ")"
-    )
+    cpu = batch_cfg.get("ocpvirt_cpu")
+    memory = batch_cfg.get("ocpvirt_memory")
+    if cpu is not None and memory is not None:
+        log.info(
+            "Creating OCP Virtualization instances "
+            "(pvc_batch_size=%s, vm_batch_size=%s, cpu=%s, memory=%s)",
+            pvc_batch_size,
+            vm_batch_size,
+            cpu,
+            memory,
+        )
+    elif profile:
+        log.info(
+            "Creating OCP Virtualization instances "
+            "(pvc_batch_size=%s, vm_batch_size=%s, profile=%s)",
+            pvc_batch_size,
+            vm_batch_size,
+            profile,
+        )
+    else:
+        log.info(
+            "Creating OCP Virtualization instances "
+            "(pvc_batch_size=%s, vm_batch_size=%s)",
+            pvc_batch_size,
+            vm_batch_size,
+        )
     ocp_cred = resolve_ocpvirt_credentials(ocp_creds, custom_config)
 
     ceph_cluster = cluster_conf.get("ceph-cluster")
@@ -1281,7 +1314,10 @@ def setup_vm_node_ocpvirt(node, ceph_nodes, **params):
             storage_class=params.get("storage_class"),
             network=params.get("network"),
             precreated_volume_names=precreated_volume_names,
-            instancetype=params.get("instancetype"),
+            instancetype=params.get("instancetype") or "",
+            cpu=params.get("cpu"),
+            memory=params.get("memory"),
+            secure_boot=params.get("secure_boot", True),
         )
         vm.role = params["role"]
         vm.root_login = params["root-login"]
@@ -1629,7 +1665,7 @@ def setup_deb_repos(node, ubuntu_repo):
 
 def setup_deb_cdn_repo(node, build=None):
     user = "redhat"
-    passwd = "OgYZNpkj6jZAIF20XFZW0gnnwYBjYcmt7PeY76bLHec9"
+    passwd = "masked"
     num = build.split(".")[0]
     cmd = (
         "umask 0077; echo deb https://{user}:{passwd}@rhcs.download.redhat.com/{num}-updates/Tools "

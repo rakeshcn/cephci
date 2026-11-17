@@ -1,7 +1,8 @@
 import re
+from distutils.version import LooseVersion
 
 from ceph.ceph_admin.common import config_dict_to_string
-from ceph.nvmeof.cli.v2.common import substitute_keys
+from ceph.nvmeof.cli.v2.common import run_with_connect_retry, substitute_keys
 from utility.log import Log
 
 LOG = Log(__name__)
@@ -18,6 +19,7 @@ KEY_MAP = {
     "no-group-append": "no-group-append",
     "rbd-pool": "rbd_pool",
     "rbd-image": "rbd_image_name",
+    "rbd-data-pool": "rbd_data_pool",
     "rbd-create-image": "create-image",
     "load-balancing-group": "load_balancing_group",
     "rbd-trash-image-on-delete": "trash-image",
@@ -35,6 +37,9 @@ KEY_MAP = {
     "w-megabytes-per-second": "w_mbytes_per_second",
     "level": "log_level",
     "auto-visible": "auto_visible",
+    # BYOK LUKS encryption (9.2+)
+    # The CLI flags use hyphens: --encryption-format, --encryption-algorithm, --key-id
+    # No translation needed — pass through as-is.
 }
 
 
@@ -80,6 +85,7 @@ class BaseCLI:
             pass
 
         cmd_args = kwargs.get("args", {})
+        ceph_version = self.get_ceph_version()
 
         # Gateway group
         if not cmd_args.get("gw_group"):
@@ -93,6 +99,11 @@ class BaseCLI:
             else:
                 cmd_args["traddr"] = self.node.ip_address
 
+        # Image size flag: --rbd-image-size (9.2+ / >= 20.2.1); --size (older)
+        if "rbd-image-size" in cmd_args:
+            if LooseVersion(ceph_version) < LooseVersion("20.2.1"):
+                cmd_args["size"] = cmd_args.pop("rbd-image-size")
+
         command = [
             self.BASE_CMD,
             self.__local_mtls_cert_path(),
@@ -101,5 +112,10 @@ class BaseCLI:
             config_dict_to_string(cmd_args),
             config_dict_to_string(base_cmd_args),
         ]
-        out, err = self.shell(args=command, pretty_print=True)
-        return out, err
+        # As a alternative to bug reported https://ibm-ceph.atlassian.net/browse/IBMCEPH-16456,
+        # Which is intermittent and happens when the NVMe CLI is executed on a gateway node.
+        # we are using a retry mechanism to handle the connection error.
+        return run_with_connect_retry(
+            lambda: self.shell(args=command, pretty_print=True),
+            description=f"NVMeoF command - {entity} {action}",
+        )

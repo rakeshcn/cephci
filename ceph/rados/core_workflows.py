@@ -27,6 +27,11 @@ from ceph.rados import utils as osd_utils
 from tests.rados.rados_test_util import wait_for_device_rados
 from utility import utils
 from utility.log import Log
+from utility.odf_defaults import (
+    _mon_name_and_ip,
+    format_mons_for_kernel_mount,
+    is_msgr1_disabled,
+)
 
 log = Log(__name__)
 
@@ -335,7 +340,10 @@ class RadosOrchestrator:
         while iteration <= retry:
             iteration += 1
             cmd = f"ceph orch host maintenance enter {hostname} --force"
-            if yes_i_really_mean_it and self.rhbuild.split(".")[0] >= "7":
+            if (
+                yes_i_really_mean_it
+                and utils.get_rhbuild_major_version(self.rhbuild) >= 7
+            ):
                 cmd = f"ceph orch host maintenance enter {hostname} --force --yes-i-really-mean-it"
             try:
                 out, err = self.client.exec_command(cmd=cmd, sudo=True, timeout=600)
@@ -1518,7 +1526,7 @@ class RadosOrchestrator:
         set_overwrites = kwargs.get("set_overwrites", True)
 
         # 1. Check Ceph version (must be tentacle/>=9)
-        if int(self.rhbuild.split(".")[0]) < 9:
+        if utils.get_rhbuild_major_version(self.rhbuild) < 9:
             log.error("Ceph version < tentacle, cannot enable fast EC features")
             return False
 
@@ -1620,7 +1628,7 @@ class RadosOrchestrator:
         )
         crush_num_failure_domains = kwargs.get("crush-num-failure-domains", None)
         create_rule = kwargs.get("create_rule", False)
-        major_version = int(self.rhbuild.split(".")[0])
+        major_version = utils.get_rhbuild_major_version(self.rhbuild)
         default_plugin = "jerasure" if major_version < 9 else "isa"
         plugin = kwargs.get("plugin", default_plugin)
         technique = kwargs.get("technique")
@@ -2106,7 +2114,7 @@ class RadosOrchestrator:
             osd: "osd" service by default or "osd.<Id>"
             reset: revert mClock profile to default - balanced
         """
-        if self.rhbuild and self.rhbuild.split(".")[0] < "6":
+        if self.rhbuild and utils.get_rhbuild_major_version(self.rhbuild) < 6:
             log.info(
                 f"mClock specific settings are not valid below RHCS 6"
                 f", as the current RH build is {self.rhbuild}, returing TRUE"
@@ -2152,7 +2160,7 @@ class RadosOrchestrator:
         Returns:
             boolean: True if mClock parameter was set, False otherwise
         """
-        if self.rhbuild and self.rhbuild.split(".")[0] < "6":
+        if self.rhbuild and utils.get_rhbuild_major_version(self.rhbuild) < 6:
             log.info(
                 f"mClock specific settings are not valid below RHCS 6"
                 f", as the current RH build is {self.rhbuild}, returing TRUE"
@@ -5256,7 +5264,7 @@ EOF"""
         """
 
         # the command "orch set-unmanaged" is not available below Reef
-        if self.rhbuild and self.rhbuild.split(".")[0] < "7":
+        if self.rhbuild and utils.get_rhbuild_major_version(self.rhbuild) < 7:
             return self.set_service_managed_type(
                 service_type=service_type, unmanaged=True
             )
@@ -5288,7 +5296,7 @@ EOF"""
         """
 
         # the command "orch set-managed" is not available below Reef
-        if self.rhbuild and self.rhbuild.split(".")[0] < "7":
+        if self.rhbuild and utils.get_rhbuild_major_version(self.rhbuild) < 7:
             return self.set_service_managed_type(
                 service_type=service_type, unmanaged=False
             )
@@ -6280,8 +6288,10 @@ EOF"""
             r"std::terminate",
             r"terminate called",
             r"\(core dumped\)",
-            # Stack traces (indicates crash dump)
-            r"[Bb]acktrace:",
+            # Stack traces (indicates crash dump).
+            # Word-boundary required: MDS debug logs "_store_backtrace:" otherwise
+            # matches and floods the report with false positives.
+            r"\b[Bb]acktrace:",
             r"ceph_stacktrace",
             r"Dumping core",
             # Exception indicators (more specific)
@@ -7421,15 +7431,85 @@ EOF"""
             enable_fast_ec_config_params=enable_fast_ec_config_params,
         )
 
+        # New FS needs its own MDS service; standbys for other FS names will not join.
+        log.info("Applying MDS orch placement for filesystem %s", fs_name)
+        # Enough daemons for max_mds scale paths up to 8 (+ standbys)
+        self.client.exec_command(
+            sudo=True,
+            cmd=(
+                f"ceph orch apply mds {fs_name} "
+                f"--placement='count-per-host:2;label:mds'"
+            ),
+        )
+        deadline = time.time() + 180
+        while time.time() < deadline:
+            try:
+                status = self.run_ceph_command(cmd=f"ceph fs status {fs_name}") or {}
+                mdsmap = status.get("mdsmap") or []
+                if any(
+                    (e.get("state") or "").startswith("active")
+                    for e in mdsmap
+                    if isinstance(e, dict)
+                ):
+                    log.info("Filesystem %s has an active MDS", fs_name)
+                    break
+            except Exception as exc:
+                log.debug("Waiting for MDS on %s: %s", fs_name, exc)
+            time.sleep(5)
+        else:
+            raise CommandFailed(
+                f"No active MDS for filesystem {fs_name} within 180s after orch apply"
+            )
+
         log.info(f"Mounting CephFS at {mount_path}")
         client_node.exec_command(
             cmd=f"mkdir -p {mount_path}", sudo=True, check_ec=False
         )
-        client_node.exec_command(
-            cmd=f"mount -t ceph admin@.{fs_name}=/ {mount_path}", sudo=True
-        )
-        log.info(f"Mounted CephFS at {mount_path}")
+        use_msgr2 = is_msgr1_disabled(client_node)
+        mount_opts = []
+        if use_msgr2:
+            mount_opts.append("ms_mode=crc")
+            try:
+                mon_dump = self.run_ceph_command(cmd="ceph mon dump", client_exec=True)
+                mon_addrs = []
+                for mon in mon_dump.get("mons") or []:
+                    parsed = _mon_name_and_ip(mon)
+                    if parsed:
+                        # mount.ceph mon_addr uses slash-separated IP:port
+                        mon_addrs.append(format_mons_for_kernel_mount(parsed[1], True))
+            except Exception as exc:
+                log.error("Could not build mon_addr for msgr2 mount: %s", exc)
+                raise CommandFailed(
+                    f"Could not build mon_addr for msgr2 CephFS mount: {exc}"
+                ) from exc
+            if not mon_addrs:
+                log.error(
+                    "msgr2 mount requires mon_addr but mon dump had no usable mons"
+                )
+                raise CommandFailed("missing mon_addr for msgr2 CephFS mount")
+            mount_opts.append("mon_addr=" + "/".join(mon_addrs))
+        mount_cmd = f"mount -t ceph admin@.{fs_name}=/ {mount_path}"
+        if mount_opts:
+            mount_cmd += " -o " + ",".join(mount_opts)
+        client_node.exec_command(cmd=mount_cmd, sudo=True)
 
+        mount_out = mount_err = ""
+        for attempt in range(1, 7):
+            mount_out, mount_err = client_node.exec_command(
+                cmd=f"findmnt -T {mount_path}", sudo=True, check_ec=False
+            )
+            log.info(
+                "findmnt attempt %s mount_out=%r mount_err=%r",
+                attempt,
+                mount_out,
+                mount_err,
+            )
+            if mount_path in (mount_out or "") and not (mount_err or "").strip():
+                break
+            time.sleep(2)
+        else:
+            raise CommandFailed(f"CephFS mount missing at {mount_path}")
+        log.info(f"Mounted CephFS at {mount_path}")
         # Return created pool names
         created_pools = [
             {
@@ -7459,6 +7539,7 @@ EOF"""
         rdma_port: Optional[int] = None,
         enable_nfsv3: bool = False,
         nfs_placement_label: Optional[str] = None,
+        enable_pec: bool = False,
     ) -> dict:
         """Create NFS clusters with a dedicated CephFS filesystem and exports.
 
@@ -7502,6 +7583,9 @@ EOF"""
                 whose ``labels`` include this string. If no orch host has
                 the label, fall back to all orch hosts. If unset, use all
                 orch hosts.
+            enable_pec (bool): Create each export on a CephFS subvolume with
+                ``--cmount_path`` (per-export client). Never uses ``--path=/``
+                (IBMCEPH-17356). Caller must version-gate (>= 20.2.2).
 
         Returns:
             dict: NFS configuration with structure::
@@ -7540,6 +7624,7 @@ EOF"""
             f"{exports_per_cluster} exports each"
             f"{', RDMA enabled' if enable_rdma else ''}"
             f"{', NFSv3 enabled on cluster' if enable_nfsv3 else ''}"
+            f"{', PEC (cmount_path)' if enable_pec else ''}"
         )
 
         # Step 1: Create CephFS filesystem for NFS
@@ -7661,27 +7746,85 @@ EOF"""
 
         # Step 3: Create exports for each cluster
         exports = []
+        pec_svg = "pecgroup" if enable_pec else None
+        if enable_pec:
+            log.info("PEC: ensuring subvolume group %s on %s", pec_svg, nfs_fs_name)
+            self.client.exec_command(
+                cmd=(
+                    f"ceph fs subvolumegroup create {nfs_fs_name} {pec_svg} "
+                    "2>/dev/null || true"
+                ),
+                sudo=True,
+                check_ec=False,
+            )
         for cluster in clusters:
             cluster_id = cluster["cluster_id"]
             for j in range(exports_per_cluster):
                 pseudo_path = f"/export/{cluster_id}/path{j + 1}"
 
                 log.info(f"Creating NFS export: {pseudo_path} on cluster {cluster_id}")
-                cmd = (
-                    f"ceph nfs export create cephfs {cluster_id} {pseudo_path} "
-                    f"{nfs_fs_name} --path=/"
-                )
+                export_entry = {
+                    "cluster_id": cluster_id,
+                    "pseudo_path": pseudo_path,
+                    "fs_name": nfs_fs_name,
+                }
+                sv_name = None
                 try:
+                    if enable_pec:
+                        sv_name = f"nfsvol_{cluster_id}_{j + 1}".replace("-", "_")
+                        self.client.exec_command(
+                            cmd=(
+                                f"ceph fs subvolume create {nfs_fs_name} {sv_name} "
+                                f"--group_name {pec_svg} --namespace-isolated"
+                            ),
+                            sudo=True,
+                        )
+                        sv_path, _ = self.client.exec_command(
+                            cmd=(
+                                f"ceph fs subvolume getpath {nfs_fs_name} {sv_name} "
+                                f"--group_name {pec_svg}"
+                            ),
+                            sudo=True,
+                        )
+                        sv_path = (sv_path or "").strip()
+                        if not sv_path:
+                            raise RuntimeError(
+                                f"empty getpath for {sv_name} on {nfs_fs_name}"
+                            )
+                        cmd = (
+                            f"ceph nfs export create cephfs {cluster_id} "
+                            f"{pseudo_path} {nfs_fs_name} "
+                            f"--path={sv_path} --cmount_path={sv_path}"
+                        )
+                        export_entry["sv_name"] = sv_name
+                        export_entry["svg"] = pec_svg
+                        export_entry["sv_path"] = sv_path
+                    else:
+                        cmd = (
+                            f"ceph nfs export create cephfs {cluster_id} "
+                            f"{pseudo_path} {nfs_fs_name} --path=/"
+                        )
                     self.client.exec_command(cmd=cmd, sudo=True)
-                    exports.append(
-                        {
-                            "cluster_id": cluster_id,
-                            "pseudo_path": pseudo_path,
-                            "fs_name": nfs_fs_name,
-                        }
-                    )
+                    exports.append(export_entry)
                 except Exception as e:
                     log.warning(f"Failed to create export {pseudo_path}: {e}")
+                    # PEC: never leave an orphaned subvolume without an export
+                    if enable_pec and sv_name and pec_svg:
+                        try:
+                            self.client.exec_command(
+                                cmd=(
+                                    f"ceph fs subvolume rm {nfs_fs_name} {sv_name} "
+                                    f"--group_name {pec_svg} --force"
+                                ),
+                                sudo=True,
+                                check_ec=False,
+                            )
+                        except Exception as rm_e:
+                            log.warning(
+                                "Failed to cleanup PEC subvolume %s: %s",
+                                sv_name,
+                                rm_e,
+                            )
 
         log.info(f"Created {len(exports)} NFS exports across {len(clusters)} clusters")
 
@@ -7706,6 +7849,8 @@ EOF"""
             "pools": created_pools,
             "enable_rdma": enable_rdma,
             "enable_nfsv3": enable_nfsv3,
+            "enable_pec": enable_pec,
+            "pec_svg": pec_svg,
         }
 
     def cleanup_nfs_clusters(self, nfs_config: dict) -> None:
@@ -7730,6 +7875,21 @@ EOF"""
                 log.debug(f"Deleted NFS export: {pseudo_path}")
             except Exception as e:
                 log.warning(f"Failed to delete export {pseudo_path}: {e}")
+            sv_name = export.get("sv_name")
+            svg = export.get("svg")
+            fs_name = export.get("fs_name")
+            if sv_name and svg and fs_name:
+                try:
+                    self.client.exec_command(
+                        cmd=(
+                            f"ceph fs subvolume rm {fs_name} {sv_name} "
+                            f"--group_name {svg} --force"
+                        ),
+                        sudo=True,
+                        check_ec=False,
+                    )
+                except Exception as e:
+                    log.warning(f"Failed to delete subvolume {sv_name}: {e}")
 
         # Step 2: Delete NFS clusters
         for cluster in nfs_config.get("clusters", []):

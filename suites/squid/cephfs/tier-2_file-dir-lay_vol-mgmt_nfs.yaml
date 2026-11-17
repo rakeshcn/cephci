@@ -459,6 +459,13 @@ tests:
       desc: Subvolume metadata creation, delete and modifying test
       abort-on-fail: false
   - test:
+      name: Subvolume invalid name must not stamp parent ceph.dir.subvolume
+      module: cephfs_vol_management.cephfs_vol_mgmt_subvolume_invalid_name_xattr.py
+      polarion-id: CEPH-83632955
+      desc: Invalid subvolume names must not stamp parent ceph.dir.subvolume
+      comments: product bug IBMCEPH-17981
+      abort-on-fail: false
+  - test:
       name: cephfs_vol_mgmt_fs_life_cycle
       module: cephfs_vol_management.cephfs_vol_mgmt_fs_life_cycle.py
       polarion-id: CEPH-11333

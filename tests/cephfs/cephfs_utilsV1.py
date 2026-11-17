@@ -111,6 +111,8 @@ class FsUtils(object):
                 "git",
                 "lua",
                 "acl",
+                "wget",
+                "git-core",
             ]
             if build.endswith("7") or build.startswith("3"):
                 pkgs.extend(
@@ -664,13 +666,22 @@ class FsUtils(object):
         )
         fs_info = json.loads(out)
         mon_ips = self.get_mon_node_ips()
-        if not set(fs_info["mon_addrs"]).issubset([f"{i}:6789" for i in mon_ips]):
+        # ms_bind_msgr1=false (ODF-like) → FS advertises msgr2 :3300; else legacy :6789
+        from utility.odf_defaults import is_msgr1_disabled
+
+        msgr1_disabled = is_msgr1_disabled(client)
+        port = "3300" if msgr1_disabled else "6789"
+        expected = [f"{ip}:{port}" for ip in mon_ips]
+        if not set(fs_info["mon_addrs"]).issubset(expected):
             log.error(
                 "Mon IPs are not matching with FS Info IPs.\n"
                 "Mon IPs as per the cluster config: %s\n"
-                "Mon IPs from FS Info: %s",
-                [f"{i}:6789" for i in mon_ips],
+                "Mon IPs from FS Info: %s\n"
+                "ms_bind_msgr1 disabled=%s (expected port %s)",
+                expected,
                 fs_info["mon_addrs"],
+                msgr1_disabled,
+                port,
             )
             return False
         return True
@@ -906,23 +917,41 @@ class FsUtils(object):
         :return:
         """
         end_time = datetime.datetime.now() + datetime.timedelta(seconds=timeout)
-        log.info("Wait for the process to start or stop")
+        log.info(
+            "Wait for NFS process %s to reach state '%s'", process_name, desired_state
+        )
         while end_time > datetime.datetime.now():
             out, rc = client.exec_command(
                 sudo=True,
                 cmd="ceph orch ps --daemon_type=nfs --format json",
                 check_ec=False,
             )
-            nfs_hosts = json.loads(out.read().decode())
-            for nfs in nfs_hosts:
-                log.info(nfs)
-                if process_name in nfs["daemon_id"] and ispresent:
-                    if nfs["status_desc"] == desired_state:
-                        log.info(nfs)
+            try:
+                nfs_hosts = json.loads(out) if out else []
+            except (TypeError, json.JSONDecodeError):
+                log.debug("Unable to parse NFS orch ps output: %s", out)
+                sleep(interval)
+                continue
+            if not isinstance(nfs_hosts, list):
+                nfs_hosts = [nfs_hosts]
+            matching = [
+                nfs for nfs in nfs_hosts if process_name in nfs.get("daemon_id", "")
+            ]
+            if ispresent:
+                for nfs in matching:
+                    log.info(nfs)
+                    if nfs.get("status_desc") == desired_state:
+                        log.info("NFS process %s is %s", process_name, desired_state)
                         return True
-                if process_name not in nfs["daemon_id"] and not ispresent:
-                    return True
+            elif not matching:
+                log.info("NFS process %s is not present", process_name)
+                return True
             sleep(interval)
+        log.error(
+            "Timed out waiting for NFS process %s to reach state '%s'",
+            process_name,
+            desired_state,
+        )
         return False
 
     def wait_for_mds_deamon(
@@ -1049,8 +1078,51 @@ class FsUtils(object):
                 f"/etc/ceph/{kwargs.get('new_client_hostname', client.node.hostname)}.secret",
             )
 
+            # Bare IP mounts default to port 6789 (msgr1). When ms_bind_msgr1=false
+            # (or monmap is v2-only), use :3300 and ms_mode=crc.
+            from utility.odf_defaults import (
+                format_mons_for_kernel_mount,
+                is_msgr1_disabled,
+                kernel_ms_mode_opt,
+            )
+
+            msgr1_disabled = is_msgr1_disabled(client)
+            monmap_v2_only = False
+            try:
+                mon_dump_raw, _ = client.exec_command(
+                    sudo=True, cmd="ceph mon dump -f json"
+                )
+                md = json.loads(mon_dump_raw or "{}")
+                has_v1 = False
+                has_v2 = False
+                for mon in md.get("mons", []):
+                    addrs = mon.get("public_addrs") or {}
+                    vec = addrs.get("addrvec") if isinstance(addrs, dict) else None
+                    if vec:
+                        for addr in vec:
+                            if addr.get("type") == "v1":
+                                has_v1 = True
+                            if addr.get("type") == "v2":
+                                has_v2 = True
+                    else:
+                        public_addr = str(
+                            mon.get("public_addr") or mon.get("addr") or ""
+                        )
+                        if "v1:" in public_addr or ":6789" in public_addr:
+                            has_v1 = True
+                        if "v2:" in public_addr or ":3300" in public_addr:
+                            has_v2 = True
+                monmap_v2_only = has_v2 and not has_v1
+            except Exception as exc:  # noqa: BLE001
+                log.debug("msgr2 monmap detection failed: %s", exc)
+
+            # Caller-supplied ms_mode (e.g. legacy in option matrix) owns the policy
+            extra = kwargs.get("extra_params") or ""
+            need_msgr2 = (msgr1_disabled or monmap_v2_only) and "ms_mode=" not in extra
+            mount_mons = format_mons_for_kernel_mount(mon_node_ip, need_msgr2)
+
             kernel_cmd = (
-                f"mount -t ceph {mon_node_ip}:{kwargs.get('sub_dir', '/')} {mount_point} "
+                f"mount -t ceph {mount_mons}:{kwargs.get('sub_dir', '/')} {mount_point} "
                 f"-o name={kwargs.get('new_client_hostname', client.node.hostname)},"
                 f"secretfile=/etc/ceph/{kwargs.get('new_client_hostname', client.node.hostname)}.secret,"
                 f"noshare"
@@ -1058,6 +1130,17 @@ class FsUtils(object):
 
             if kwargs.get("extra_params"):
                 kernel_cmd += f"{kwargs.get('extra_params')}"
+
+            ms_opt = kernel_ms_mode_opt(need_msgr2, existing=extra + kernel_cmd)
+            if ms_opt:
+                kernel_cmd += ms_opt
+                log.info(
+                    "msgr2 required (ms_bind_msgr1_disabled=%s monmap_v2_only=%s): "
+                    "using mon %s and ms_mode=crc",
+                    msgr1_disabled,
+                    monmap_v2_only,
+                    mount_mons,
+                )
 
             cmd_rc = client.exec_command(sudo=True, cmd=kernel_cmd, long_running=True)
 
